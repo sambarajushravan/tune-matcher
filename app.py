@@ -3,6 +3,7 @@ import librosa
 import numpy as np
 from audio_recorder_streamlit import audio_recorder
 import io
+import os
 
 # --- APP CONFIG ---
 st.set_page_config(page_title="Tune Matcher", page_icon="🎤")
@@ -12,16 +13,28 @@ st.write("Match the tune and timing at 90% or higher to pass!")
 # 1. User Info
 user_id = st.text_input("Enter your Name or ID:", "")
 
-# 2. Song Selection
-songs_list = {
-    "Song 1: Happy Birthday": "songs/song1.wav",
-    "Song 2: Imagine": "songs/song2.wav",
-    # Add all 18 here...
-}
-selected_song = st.selectbox("Choose a song to practice:", list(songs_list.keys()))
+# --- DYNAMIC SONG LOADING ---
+SONG_DIR = "songs"
 
-if user_id:
-    st.audio(songs_list[selected_song]) # Play the reference for them
+# This looks into the folder and finds all .wav files
+if os.path.exists(SONG_DIR):
+    # Get filenames, remove the '.wav' extension for the display name
+    available_songs = {f.replace('.wav', ''): os.path.join(SONG_DIR, f)
+                       for f in sorted(os.listdir(SONG_DIR)) if f.endswith('.wav')}
+else:
+    available_songs = {}
+    st.error("Songs directory not found! Please check your GitHub folder structure.")
+
+# 2. Song Selection (Now using the dynamic list)
+selected_song_path = None
+if available_songs:
+    selected_song_name = st.selectbox("Choose a song to practice:", list(available_songs.keys()))
+    selected_song_path = available_songs[selected_song_name]
+else:
+    st.warning("No songs found in the /songs folder.")
+
+if user_id and selected_song_path:
+    st.audio(selected_song_path) # Play the reference for them
     
     st.write("Click the mic and start singing!")
     audio_bytes = audio_recorder(text="Click to record", pause_threshold=2.0)
@@ -29,7 +42,7 @@ if user_id:
     if audio_bytes:
         with st.spinner("Calculating your score..."):
             # Load Reference and User Audio
-            y_ref, sr = librosa.load(songs_list[selected_song], sr=22050)
+            y_ref, sr = librosa.load(selected_song_path, sr=22050)
             
             # Convert bytes to librosa format
             buffer = io.BytesIO(audio_bytes)
