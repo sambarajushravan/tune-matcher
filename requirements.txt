@@ -2,5 +2,5 @@ streamlit
 librosa
 numpy
 soundfile
-streamlit-audiorecorder
+audio-recorder-streamlit
 st-gsheets-connection
