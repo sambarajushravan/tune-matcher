@@ -45,9 +45,16 @@ if user_id and selected_song_path:
     if audio_bytes:
         with st.spinner("Analyzing your tune and timing..."):
             # 1. Load Audio
-            # We load both at 22050Hz for standard processing
+            # Load Reference Audio (.wav from your folder)
             y_ref, sr = librosa.load(selected_song_path, sr=22050)
-            y_user, _ = librosa.load(io.BytesIO(audio_bytes), sr=22050)
+
+            # --- SAFE IPHONE AUDIO LOADING ---
+            try:
+                # This safely converts the iPhone's microphone bytes on the fly
+                y_user, _ = librosa.load(io.BytesIO(audio_bytes), sr=22050)
+            except Exception as e:
+                st.error("Audio format error. Please try recording again or use Google Chrome.")
+                st.stop()
 
             # 2. Extract Pitch (f0)
             # We define a human vocal range: C2 (~65Hz) to C7 (~2093Hz)

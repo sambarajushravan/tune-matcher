@@ -4,3 +4,4 @@ numpy
 soundfile
 audio-recorder-streamlit
 st-gsheets-connection
+audioread
