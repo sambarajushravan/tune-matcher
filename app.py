@@ -43,58 +43,60 @@ if user_id and selected_song_path:
     audio_bytes = audio_recorder(text="Click to record", pause_threshold=2.0)
 
     if audio_bytes:
-        with st.spinner("Analyzing your tune and timing..."):
-            # 1. Load Audio
-            # Load Reference Audio (.wav from your folder)
-            y_ref, sr = librosa.load(selected_song_path, sr=22050)
+        with st.spinner("Analyzing your pronunciation, timing, and tune..."):
+            # 1. Load Audio files
+            y_ref, sr_ref = librosa.load(selected_song_path, sr=22050)
 
-            # --- SAFE IPHONE AUDIO LOADING ---
             try:
-                # This safely converts the iPhone's microphone bytes on the fly
-                y_user, _ = librosa.load(io.BytesIO(audio_bytes), sr=22050)
+                y_user, sr_user = librosa.load(io.BytesIO(audio_bytes), sr=22050)
             except Exception as e:
-                st.error("Audio format error. Please try recording again or use Google Chrome.")
+                st.error("Audio decoding error. Please try recording again.")
                 st.stop()
 
-            # 2. Extract Pitch (f0)
-            # We define a human vocal range: C2 (~65Hz) to C7 (~2093Hz)
-            f0_ref, voiced_flag_ref, voiced_probs_ref = librosa.pyin(
-                y_ref, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7')
-            )
-            f0_user, voiced_flag_user, voiced_probs_user = librosa.pyin(
-                y_user, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7')
-            )
+            # --- 2. TIME CHECK (STRICT TEMPO) ---
+            duration_ref = librosa.get_duration(y=y_ref, sr=sr_ref)
+            duration_user = librosa.get_duration(y=y_user, sr=sr_user)
 
-            # 3. Clean Data (Handle silence/NaN)
-            f0_ref = np.nan_to_num(f0_ref)
-            f0_user = np.nan_to_num(f0_user)
+            # If they finish more than 15% too fast or too slow, penalize them
+            time_ratio = min(duration_ref, duration_user) / max(duration_ref, duration_user)
 
-            # 4. Dynamic Time Warping (DTW)
-            # This aligns the user's recording to the reference timing
-            # D = Distance matrix, wp = Warping path (the "alignment" map)
-            D, wp = librosa.sequence.dtw(X=f0_ref, Y=f0_user, backtrack=True)
+            # --- 3. PRONUNCIATION & TUNE MATCHING (MFCC + CHROMA) ---
+            # MFCCs track vocal tract shape (pronunciation/lyrics)
+            mfcc_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13)
+            mfcc_user = librosa.feature.mfcc(y=y_user, sr=sr_user, n_mfcc=13)
 
-            # 5. Calculate Similarity
-            # We look at the aligned points and find the average frequency difference
-            diffs = []
-            for ref_idx, user_idx in wp:
-                if f0_ref[ref_idx] > 0 and f0_user[user_idx] > 0:
-                    # Difference in Hz
-                    diff = abs(f0_ref[ref_idx] - f0_user[user_idx])
-                    diffs.append(diff)
+            # Chroma tracks the musical notes, ignoring male/female octave differences
+            chroma_ref = librosa.feature.chroma_stft(y=y_ref, sr=sr_ref)
+            chroma_user = librosa.feature.chroma_stft(y=y_user, sr=sr_user)
 
-            # 6. Generate the 0-100% Score
-            if not diffs:
-                score = 0.0
-            else:
-                avg_hz_diff = np.mean(diffs)
-                # Formula: If avg diff is 0Hz = 100%.
-                # We penalize roughly 1% per 2Hz of average error.
-                score = max(0, 100 - (avg_hz_diff / 2.0))
-                score = round(float(score), 2)
+            # Combine features into a comprehensive "voice print"
+            features_ref = np.vstack([mfcc_ref, chroma_ref])
+            features_user = np.vstack([mfcc_user, chroma_user])
 
-            # Now show the real result!
-            st.metric("Tune Accuracy", f"{score}%")
+            # --- 4. DYNAMIC TIME WARPING (TIMING PATTERN MATCH) ---
+            # D is the cumulative cost matrix. wp is the alignment path.
+            D, wp = librosa.sequence.dtw(X=features_ref, Y=features_user, backtrack=True)
+
+            # THE FIX: Grab the final accumulated cost at the top-right corner
+            # and divide by the length of the warping path to normalize it.
+            final_accumulated_cost = D[-1, -1]
+            path_length = len(wp)
+            norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100
+
+            # --- 5. COMPUTE FINAL HYBRID SCORE ---
+            # CALIBRATION FACTOR: Increase this number to make it HARDER to get 90%
+            # Decrease this number if even good singers are failing.
+            CALIBRATION_FACTOR = 2.5
+
+            # Base accuracy from normalized pronunciation/tune distance
+            base_score = max(0, 100 - (norm_dist * CALIBRATION_FACTOR))
+
+            # Multiply by our time ratio to strictly punish pacing errors
+            final_score = base_score * time_ratio
+            score = round(float(final_score), 2)
+
+            st.metric("Overall Match Score", f"{score}%")
+            st.caption(f"Tempo Accuracy: {round(time_ratio * 100, 1)}% | Timing Target: {round(duration_ref, 1)}s")
 
         # --- GOOGLE SHEETS UPSERT LOGIC (Per Song) ---
         if score >= 90:
