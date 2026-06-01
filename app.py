@@ -69,31 +69,39 @@ if user_id and selected_song_path:
             chroma_ref = librosa.feature.chroma_stft(y=y_ref, sr=sr_ref)
             chroma_user = librosa.feature.chroma_stft(y=y_user, sr=sr_user)
 
+            # THE FIX: Scale MFCCs down so they don't overpower the Chroma features
+            # This locks both feature spaces into comparable bounds
+            mfcc_ref_norm = (mfcc_ref - np.mean(mfcc_ref)) / (np.std(mfcc_ref) + 1e-6)
+            mfcc_user_norm = (mfcc_user - np.mean(mfcc_user)) / (np.std(mfcc_user) + 1e-6)
+
             # Combine features into a comprehensive "voice print"
-            features_ref = np.vstack([mfcc_ref, chroma_ref])
-            features_user = np.vstack([mfcc_user, chroma_user])
+            features_ref = np.vstack([mfcc_ref_norm, chroma_ref])
+            features_user = np.vstack([mfcc_user_norm, chroma_user])
 
             # --- 4. DYNAMIC TIME WARPING (TIMING PATTERN MATCH) ---
-            # D is the cumulative cost matrix. wp is the alignment path.
-            D, wp = librosa.sequence.dtw(X=features_ref, Y=features_user, backtrack=True)
+            # We specify metric='cosine' to evaluate the similarity of the shape,
+            # which prevents clipping regardless of the volume or length!
+            D, wp = librosa.sequence.dtw(X=features_ref, Y=features_user, metric='cosine', backtrack=True)
 
-            # THE FIX: Grab the final accumulated cost at the top-right corner
-            # and divide by the length of the warping path to normalize it.
+            # Grab the final accumulated cost at the top-right corner and normalize by path length
             final_accumulated_cost = D[-1, -1]
             path_length = len(wp)
-            norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100
+            norm_dist = final_accumulated_cost / path_length if path_length > 0 else 1.0
 
             # --- 5. COMPUTE FINAL HYBRID SCORE ---
-            # CALIBRATION FACTOR: Increase this number to make it HARDER to get 90%
-            # Decrease this number if even good singers are failing.
-            CALIBRATION_FACTOR = 2.5
-
-            # Base accuracy from normalized pronunciation/tune distance
-            base_score = max(0, 100 - (norm_dist * CALIBRATION_FACTOR))
+            # Cosine DTW distance natively ranges roughly from 0.0 to 1.0.
+            # 0.0 distance means a flawless copy. 1.0 means complete mismatch.
+            # We subtract it from 1 to flip it to an accuracy percentage (0.0 to 100.0)
+            base_score = max(0.0, 100.0 * (1.0 - norm_dist))
 
             # Multiply by our time ratio to strictly punish pacing errors
             final_score = base_score * time_ratio
             score = round(float(final_score), 2)
+
+            # Safety: cosine distance is undefined for silent/all-zero frames,
+            # which can produce NaN. Treat that as a 0% match.
+            if np.isnan(score):
+                score = 0.0
 
             st.metric("Overall Match Score", f"{score}%")
             st.caption(f"Tempo Accuracy: {round(time_ratio * 100, 1)}% | Timing Target: {round(duration_ref, 1)}s")
