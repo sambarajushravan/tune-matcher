@@ -60,26 +60,42 @@ if user_id and selected_song_path:
             # If they finish more than 15% too fast or too slow, penalize them
             time_ratio = min(duration_ref, duration_user) / max(duration_ref, duration_user)
 
-            # --- 3. PRONUNCIATION & TUNE MATCHING (MFCC + CHROMA) ---
-            # MFCCs track vocal tract shape (pronunciation/lyrics)
-            mfcc_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13)
-            mfcc_user = librosa.feature.mfcc(y=y_user, sr=sr_user, n_mfcc=13)
+            # --- 3. PRONUNCIATION, TUNE, & MELODY MATCHING ---
+            hop_len = 512
 
-            # Chroma tracks the musical notes, ignoring male/female octave differences
-            chroma_ref = librosa.feature.chroma_stft(y=y_ref, sr=sr_ref)
-            chroma_user = librosa.feature.chroma_stft(y=y_user, sr=sr_user)
+            # Layer A: Pronunciation (MFCC)
+            mfcc_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13, hop_length=hop_len)
+            mfcc_user = librosa.feature.mfcc(y=y_user, sr=sr_user, n_mfcc=13, hop_length=hop_len)
 
-            # THE FIX: Scale MFCCs down so they don't overpower the Chroma features
-            # This locks both feature spaces into comparable bounds
+            # Layer B: Musical Notes (Chroma)
+            chroma_ref = librosa.feature.chroma_stft(y=y_ref, sr=sr_ref, hop_length=hop_len)
+            chroma_user = librosa.feature.chroma_stft(y=y_user, sr=sr_user, hop_length=hop_len)
+
+            # THE FIX LAYER C: Pitch Tracking (f0) to stop completely different songs from matching
+            f0_ref, _, _ = librosa.pyin(y_ref, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr_ref, hop_length=hop_len)
+            f0_user, _, _ = librosa.pyin(y_user, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr_user, hop_length=hop_len)
+
+            # Clean up pitch tracking NaNs (silence/unvoiced frames) safely
+            f0_ref = np.nan_to_num(f0_ref)
+            f0_user = np.nan_to_num(f0_user)
+
+            # Normalize Pitch so Male vs Female doesn't fail (Tracks the change/shape of the melody)
+            f0_ref_norm = (f0_ref - np.mean(f0_ref)) / (np.std(f0_ref) + 1e-6) if np.std(f0_ref) > 0 else f0_ref
+            f0_user_norm = (f0_user - np.mean(f0_user)) / (np.std(f0_user) + 1e-6) if np.std(f0_user) > 0 else f0_user
+
+            # Reshape normalized pitch to fit into the stack matrix (1 row, N columns)
+            f0_ref_norm = f0_ref_norm.reshape(1, -1)
+            f0_user_norm = f0_user_norm.reshape(1, -1)
+
+            # Normalize MFCCs
             mfcc_ref_norm = (mfcc_ref - np.mean(mfcc_ref)) / (np.std(mfcc_ref) + 1e-6)
             mfcc_user_norm = (mfcc_user - np.mean(mfcc_user)) / (np.std(mfcc_user) + 1e-6)
 
-            # Combine features into a comprehensive "voice print"
-            features_ref = np.vstack([mfcc_ref_norm, chroma_ref])
-            features_user = np.vstack([mfcc_user_norm, chroma_user])
+            # GLUE ALL 3 LAYERS TOGETHER: Words + Notes + Melody Line
+            features_ref = np.vstack([mfcc_ref_norm, chroma_ref, f0_ref_norm])
+            features_user = np.vstack([mfcc_user_norm, chroma_user, f0_user_norm])
 
-            # --- 4. DYNAMIC TIME WARPING (STRICT EUCLIDEAN MATCH) ---
-            # Switching back to 'euclidean' forces literal data shapes to line up.
+            # --- 4. DYNAMIC TIME WARPING WITH STRICTOR COUNTERMEASURES ---
             D, wp = librosa.sequence.dtw(X=features_ref, Y=features_user, metric='euclidean', backtrack=True)
 
             final_accumulated_cost = D[-1, -1]
@@ -87,17 +103,12 @@ if user_id and selected_song_path:
             norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100.0
 
             # --- 5. COMPUTE FINAL HYBRID SCORE ---
-            # STRICTNESS TUNING: Higher = harder to pass.
-            # If a different song is still scoring high, raise this to 15.0 or 20.0
-            STRICTNESS_FACTOR = 12.5
+            # Adjusted strictness now that the feature vector has a melody weight anchor
+            STRICTNESS_FACTOR = 16.0
 
-            # Base accuracy from strict normalized distance
             base_score = max(0.0, 100.0 - (norm_dist * STRICTNESS_FACTOR))
-
-            # Multiply by our time ratio to punish pacing errors
             final_score = base_score * time_ratio
 
-            # Safe NaN check
             if np.isnan(final_score) or np.isinf(final_score):
                 score = 0.0
             else:
