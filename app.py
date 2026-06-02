@@ -109,11 +109,18 @@ if user_id and selected_song_path:
             norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100.0
 
             # --- 5. COMPUTE FINAL HYBRID SCORE (ANCHOR SCALING) ---
-            # Distance <= 1.90 is an excellent match. Scores drop fast over 1.90.
-            if norm_dist <= 1.90:
-                base_score = 100.0 - ((norm_dist / 1.90) * 5.0)
+            # GOOD_MATCH_DIST = distance a correct rendition lands near (measured ~1.92).
+            # PENALTY_SLOPE   = how fast the score collapses once past the anchor.
+            # CAUTION: right (~1.92) and wrong (~2.15) are only ~0.23 apart, so this slope
+            # must be steep to push wrong songs into the 10-20 range. That makes the passing
+            # window narrow -- if good singers start failing, lower PENALTY_SLOPE.
+            GOOD_MATCH_DIST = 1.92
+            PENALTY_SLOPE = 320.0
+
+            if norm_dist <= GOOD_MATCH_DIST:
+                base_score = 100.0 - ((norm_dist / GOOD_MATCH_DIST) * 5.0)
             else:
-                base_score = max(0.0, 95.0 - ((norm_dist - 1.90) * 150.0))
+                base_score = max(0.0, 95.0 - ((norm_dist - GOOD_MATCH_DIST) * PENALTY_SLOPE))
             
             # Apply tempo accuracy multiplier
             final_score = base_score * time_ratio
@@ -132,40 +139,46 @@ if user_id and selected_song_path:
             st.balloons()
             st.success(f"🎉 PASS! You qualified for {selected_song_name} with {score}%!")
 
-            conn = st.connection("gsheets", type=GSheetsConnection)
-            expected_columns = ["User ID", "Song", "Score", "Status", "Last Attempt"]
+            # Saving to the leaderboard must never crash the app: if the Sheet is
+            # unreachable/misconfigured, the user still sees their passing score.
+            try:
+                conn = st.connection("gsheets", type=GSheetsConnection)
+                expected_columns = ["User ID", "Song", "Score", "Status", "Last Attempt"]
 
-            df = conn.read(ttl=0)
-            df = df.dropna(how="all")
-            
-            for col in expected_columns:
-                if col not in df.columns:
-                    df[col] = pd.Series(dtype="object")
+                df = conn.read(ttl=0)
+                df = df.dropna(how="all")
 
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            new_data = {
-                "User ID": user_id,
-                "Song": selected_song_name,
-                "Score": score,
-                "Status": "QUALIFIED",
-                "Last Attempt": timestamp,
-            }
+                for col in expected_columns:
+                    if col not in df.columns:
+                        df[col] = pd.Series(dtype="object")
 
-            mask = (df["User ID"] == user_id) & (df["Song"] == selected_song_name)
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                new_data = {
+                    "User ID": user_id,
+                    "Song": selected_song_name,
+                    "Score": score,
+                    "Status": "QUALIFIED",
+                    "Last Attempt": timestamp,
+                }
 
-            if mask.any():
-                df.loc[mask, ["Score", "Last Attempt"]] = [score, timestamp]
-            else:
-                df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
+                mask = (df["User ID"] == user_id) & (df["Song"] == selected_song_name)
 
-            conn.update(data=df)
+                if mask.any():
+                    df.loc[mask, ["Score", "Last Attempt"]] = [score, timestamp]
+                else:
+                    df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
 
-            user_progress = df[df["User ID"] == user_id]
-            songs_passed = len(user_progress[user_progress["Status"] == "QUALIFIED"])
-            st.info(f"Progress: You have qualified for {songs_passed} out of 18 songs!")
+                conn.update(data=df)
 
-            if songs_passed == 18:
-                st.snow()
-                st.success("🏆 AMAZING! You have qualified for ALL 18 songs!")
+                user_progress = df[df["User ID"] == user_id]
+                songs_passed = len(user_progress[user_progress["Status"] == "QUALIFIED"])
+                st.info(f"Progress: You have qualified for {songs_passed} out of 18 songs!")
+
+                if songs_passed == 18:
+                    st.snow()
+                    st.success("🏆 AMAZING! You have qualified for ALL 18 songs!")
+            except Exception as e:
+                st.warning("Your score counts, but we couldn't reach the leaderboard right now. "
+                           "(Check that the Google Sheet is shared with the service account email.)")
         else:
             st.error(f"Score: {score}%. You need 90% to qualify for this song. Try again!")
