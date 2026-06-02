@@ -78,33 +78,33 @@ if user_id and selected_song_path:
             features_ref = np.vstack([mfcc_ref_norm, chroma_ref])
             features_user = np.vstack([mfcc_user_norm, chroma_user])
 
-            # --- 4. DYNAMIC TIME WARPING (TIMING PATTERN MATCH) ---
-            # We specify metric='cosine' to evaluate the similarity of the shape,
-            # which prevents clipping regardless of the volume or length!
-            D, wp = librosa.sequence.dtw(X=features_ref, Y=features_user, metric='cosine', backtrack=True)
+            # --- 4. DYNAMIC TIME WARPING (STRICT EUCLIDEAN MATCH) ---
+            # Switching back to 'euclidean' forces literal data shapes to line up.
+            D, wp = librosa.sequence.dtw(X=features_ref, Y=features_user, metric='euclidean', backtrack=True)
 
-            # Grab the final accumulated cost at the top-right corner and normalize by path length
             final_accumulated_cost = D[-1, -1]
             path_length = len(wp)
-            norm_dist = final_accumulated_cost / path_length if path_length > 0 else 1.0
+            norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100.0
 
             # --- 5. COMPUTE FINAL HYBRID SCORE ---
-            # Cosine DTW distance natively ranges roughly from 0.0 to 1.0.
-            # 0.0 distance means a flawless copy. 1.0 means complete mismatch.
-            # We subtract it from 1 to flip it to an accuracy percentage (0.0 to 100.0)
-            base_score = max(0.0, 100.0 * (1.0 - norm_dist))
+            # STRICTNESS TUNING: Higher = harder to pass.
+            # If a different song is still scoring high, raise this to 15.0 or 20.0
+            STRICTNESS_FACTOR = 12.5
 
-            # Multiply by our time ratio to strictly punish pacing errors
+            # Base accuracy from strict normalized distance
+            base_score = max(0.0, 100.0 - (norm_dist * STRICTNESS_FACTOR))
+
+            # Multiply by our time ratio to punish pacing errors
             final_score = base_score * time_ratio
-            score = round(float(final_score), 2)
 
-            # Safety: cosine distance is undefined for silent/all-zero frames,
-            # which can produce NaN. Treat that as a 0% match.
-            if np.isnan(score):
+            # Safe NaN check
+            if np.isnan(final_score) or np.isinf(final_score):
                 score = 0.0
+            else:
+                score = round(float(final_score), 2)
 
             st.metric("Overall Match Score", f"{score}%")
-            st.caption(f"Tempo Accuracy: {round(time_ratio * 100, 1)}% | Timing Target: {round(duration_ref, 1)}s")
+            st.caption(f"Raw Dist: {round(norm_dist, 2)} | Tempo Acc: {round(time_ratio * 100, 1)}%")
 
         # --- GOOGLE SHEETS UPSERT LOGIC (Per Song) ---
         if score >= 90:
