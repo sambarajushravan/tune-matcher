@@ -109,13 +109,13 @@ if user_id and selected_song_path:
             norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100.0
 
             # --- 5. COMPUTE FINAL HYBRID SCORE (ANCHOR SCALING) ---
-            # GOOD_MATCH_DIST = distance a correct rendition lands near (measured ~1.92).
+            # GOOD_MATCH_DIST = distance a correct rendition lands near (~1.90).
             # PENALTY_SLOPE   = how fast the score collapses once past the anchor.
-            # CAUTION: right (~1.92) and wrong (~2.15) are only ~0.23 apart, so this slope
-            # must be steep to push wrong songs into the 10-20 range. That makes the passing
-            # window narrow -- if good singers start failing, lower PENALTY_SLOPE.
-            GOOD_MATCH_DIST = 1.92
-            PENALTY_SLOPE = 320.0
+            # Gentle slope: keeps correct attempts (whose raw dist varies a bit) in the 90s
+            # while still dropping wrong songs (~2.15) below 50. Worst case for a wrong song
+            # is 0 once its distance is large enough.
+            GOOD_MATCH_DIST = 1.90
+            PENALTY_SLOPE = 150.0
 
             if norm_dist <= GOOD_MATCH_DIST:
                 base_score = 100.0 - ((norm_dist / GOOD_MATCH_DIST) * 5.0)
