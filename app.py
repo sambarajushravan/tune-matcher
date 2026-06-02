@@ -182,3 +182,58 @@ if user_id and selected_song_path:
                            "(Check that the Google Sheet is shared with the service account email.)")
         else:
             st.error(f"Score: {score}%. You need 85% to qualify for this song. Try again!")
+
+# --- OPTIONAL: ADMIN REPORTING SECTION ---
+st.write("---")
+with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
+    admin_password = st.text_input("Enter Admin Password:", type="password")
+
+    if admin_password:
+        # THE SECURE FIX: Fetch the password safely from Streamlit's secrets manager.
+        # Guard against a missing [admin] secret (e.g. not configured on Streamlit Cloud)
+        # or a Sheets read failure so the admin panel never hard-crashes the app.
+        try:
+            correct_password = st.secrets["admin"]["password"]
+        except (KeyError, FileNotFoundError):
+            st.error("Admin password is not configured. Add an [admin] password to the app secrets.")
+            correct_password = None
+
+        if correct_password is None:
+            pass
+        elif admin_password == correct_password:
+            st.success("Access Granted! Fetching real-time reports...")
+
+            try:
+                # Connect and read fresh data from the sheet
+                conn = st.connection("gsheets", type=GSheetsConnection)
+                admin_df = conn.read(ttl=0).dropna(how="all")
+
+                if not admin_df.empty:
+                    # Metric Summary Cards
+                    total_passes = len(admin_df)
+                    unique_singers = admin_df["User ID"].nunique()
+
+                    col1, col2 = st.columns(2)
+                    col1.metric("Total Qualifications Logged", total_passes)
+                    col2.metric("Total Unique Active Users", unique_singers)
+
+                    # Leaderboard Chart
+                    st.subheader("🏆 Top Participant Progress")
+                    leaderboard = admin_df["User ID"].value_counts().reset_index()
+                    leaderboard.columns = ["User ID", "Songs Completed (Out of 18)"]
+                    st.dataframe(leaderboard, use_container_width=True)
+
+                    # Song Difficulty Chart
+                    st.subheader("🎵 Completion Rates by Song")
+                    song_counts = admin_df["Song"].value_counts()
+                    st.bar_chart(song_counts)
+
+                    # Raw Data Viewer
+                    st.subheader("📋 Raw Activity Log")
+                    st.dataframe(admin_df.sort_values(by="Last Attempt", ascending=False), use_container_width=True)
+                else:
+                    st.info("The database sheet is currently empty. No stats to report yet!")
+            except Exception as e:
+                st.error("Could not load reports from Google Sheets right now. Please try again later.")
+        else:
+            st.error("Incorrect Password.")

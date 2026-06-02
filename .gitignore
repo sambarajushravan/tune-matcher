@@ -23,3 +23,6 @@ test_gsheets.py
 # Temp audio / build artifacts
 subs/
 *.webm
+
+# Local summary doc (not part of the app)
+tune_matcher_summary.pdf
