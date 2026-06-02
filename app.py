@@ -13,6 +13,37 @@ st.set_page_config(page_title="Tune Matcher", page_icon="🎤")
 st.title("🎤 Tune Matcher Challenge")
 st.write("Match the tune and timing at 90% or higher to pass!")
 
+HOP_LEN = 512
+
+
+def stack_features(mfcc, chroma, f0):
+    """Stack the 3 feature layers, truncating to the shortest frame count for safety."""
+    n = min(mfcc.shape[1], chroma.shape[1], f0.shape[1])
+    return np.vstack([mfcc[:, :n], chroma[:, :n], f0[:, :n]])
+
+
+@st.cache_data(show_spinner=False)
+def get_reference_features(path):
+    """Compute and cache the reference song's feature matrix (it never changes)."""
+    y_ref, sr_ref = librosa.load(path, sr=22050)
+    duration_ref = librosa.get_duration(y=y_ref, sr=sr_ref)
+
+    mfcc_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13, hop_length=HOP_LEN)
+    chroma_ref = librosa.feature.chroma_stft(y=y_ref, sr=sr_ref, hop_length=HOP_LEN)
+    f0_ref, _, _ = librosa.pyin(
+        y_ref, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'),
+        sr=sr_ref, hop_length=HOP_LEN,
+    )
+    f0_ref = np.nan_to_num(f0_ref)
+
+    mfcc_ref_norm = (mfcc_ref - np.mean(mfcc_ref)) / (np.std(mfcc_ref) + 1e-6)
+    f0_ref_norm = (f0_ref - np.mean(f0_ref)) / (np.std(f0_ref) + 1e-6) if np.std(f0_ref) > 0 else f0_ref
+    f0_ref_norm = f0_ref_norm.reshape(1, -1)
+
+    features_ref = stack_features(mfcc_ref_norm, chroma_ref, f0_ref_norm)
+    return features_ref, duration_ref
+
+
 # 1. User Info
 user_id = st.text_input("Enter your Name or ID:", "")
 
@@ -44,58 +75,40 @@ if user_id and selected_song_path:
 
     if audio_bytes:
         with st.spinner("Analyzing your pronunciation, timing, and tune..."):
-            # 1. Load Audio files
-            y_ref, sr_ref = librosa.load(selected_song_path, sr=22050)
-
+            # 1. Load the user's recording (reference features are cached separately)
             try:
                 y_user, sr_user = librosa.load(io.BytesIO(audio_bytes), sr=22050)
             except Exception as e:
                 st.error("Audio decoding error. Please try recording again.")
                 st.stop()
 
+            # Reference is computed once and cached (it never changes between attempts)
+            features_ref, duration_ref = get_reference_features(selected_song_path)
+
             # --- 2. TIME CHECK (STRICT TEMPO) ---
-            duration_ref = librosa.get_duration(y=y_ref, sr=sr_ref)
             duration_user = librosa.get_duration(y=y_user, sr=sr_user)
 
             # If they finish more than 15% too fast or too slow, penalize them
             time_ratio = min(duration_ref, duration_user) / max(duration_ref, duration_user)
 
-            # --- 3. PRONUNCIATION, TUNE, & MELODY MATCHING ---
-            hop_len = 512
-
+            # --- 3. USER FEATURES: PRONUNCIATION, TUNE, & MELODY ---
             # Layer A: Pronunciation (MFCC)
-            mfcc_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13, hop_length=hop_len)
-            mfcc_user = librosa.feature.mfcc(y=y_user, sr=sr_user, n_mfcc=13, hop_length=hop_len)
-
+            mfcc_user = librosa.feature.mfcc(y=y_user, sr=sr_user, n_mfcc=13, hop_length=HOP_LEN)
             # Layer B: Musical Notes (Chroma)
-            chroma_ref = librosa.feature.chroma_stft(y=y_ref, sr=sr_ref, hop_length=hop_len)
-            chroma_user = librosa.feature.chroma_stft(y=y_user, sr=sr_user, hop_length=hop_len)
-
-            # THE FIX LAYER C: Pitch Tracking (f0) to stop completely different songs from matching
-            f0_ref, _, _ = librosa.pyin(y_ref, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr_ref, hop_length=hop_len)
-            f0_user, _, _ = librosa.pyin(y_user, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr_user, hop_length=hop_len)
-
-            # Clean up pitch tracking NaNs (silence/unvoiced frames) safely
-            f0_ref = np.nan_to_num(f0_ref)
+            chroma_user = librosa.feature.chroma_stft(y=y_user, sr=sr_user, hop_length=HOP_LEN)
+            # Layer C: Pitch Tracking (f0) to stop completely different songs from matching
+            f0_user, _, _ = librosa.pyin(y_user, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr_user, hop_length=HOP_LEN)
             f0_user = np.nan_to_num(f0_user)
 
-            # Normalize Pitch so Male vs Female doesn't fail (Tracks the change/shape of the melody)
-            f0_ref_norm = (f0_ref - np.mean(f0_ref)) / (np.std(f0_ref) + 1e-6) if np.std(f0_ref) > 0 else f0_ref
+            # Normalize so male vs female doesn't fail (tracks the change/shape, not absolute pitch)
+            mfcc_user_norm = (mfcc_user - np.mean(mfcc_user)) / (np.std(mfcc_user) + 1e-6)
             f0_user_norm = (f0_user - np.mean(f0_user)) / (np.std(f0_user) + 1e-6) if np.std(f0_user) > 0 else f0_user
-
-            # Reshape normalized pitch to fit into the stack matrix (1 row, N columns)
-            f0_ref_norm = f0_ref_norm.reshape(1, -1)
             f0_user_norm = f0_user_norm.reshape(1, -1)
 
-            # Normalize MFCCs
-            mfcc_ref_norm = (mfcc_ref - np.mean(mfcc_ref)) / (np.std(mfcc_ref) + 1e-6)
-            mfcc_user_norm = (mfcc_user - np.mean(mfcc_user)) / (np.std(mfcc_user) + 1e-6)
-
             # GLUE ALL 3 LAYERS TOGETHER: Words + Notes + Melody Line
-            features_ref = np.vstack([mfcc_ref_norm, chroma_ref, f0_ref_norm])
-            features_user = np.vstack([mfcc_user_norm, chroma_user, f0_user_norm])
+            features_user = stack_features(mfcc_user_norm, chroma_user, f0_user_norm)
 
-            # --- 4. DYNAMIC TIME WARPING WITH STRICTOR COUNTERMEASURES ---
+            # --- 4. DYNAMIC TIME WARPING WITH STRICT COUNTERMEASURES ---
             D, wp = librosa.sequence.dtw(X=features_ref, Y=features_user, metric='euclidean', backtrack=True)
 
             final_accumulated_cost = D[-1, -1]

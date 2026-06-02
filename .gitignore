@@ -1,0 +1,21 @@
+# Streamlit secrets (NEVER commit credentials / private keys)
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+
+# Temp audio / build artifacts
+subs/
+*.webm
