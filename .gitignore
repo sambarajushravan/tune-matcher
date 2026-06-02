@@ -8,8 +8,12 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv_test/
 venv/
 env/
+
+# Local connectivity test helper
+test_gsheets.py
 
 # OS / editor cruft
 .DS_Store

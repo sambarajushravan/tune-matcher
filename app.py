@@ -11,7 +11,7 @@ import pandas as pd
 # --- APP CONFIG ---
 st.set_page_config(page_title="Tune Matcher", page_icon="🎤")
 st.title("🎤 Tune Matcher Challenge")
-st.write("Match the tune and timing at 90% or higher to pass!")
+st.write("Match the tune and timing at 85% or higher to pass!")
 
 # 1. User Info
 user_id = st.text_input("Enter your Name or ID:", "")
@@ -135,7 +135,7 @@ if user_id and selected_song_path:
             st.caption(f"Raw Dist: {round(norm_dist, 2)} | Tempo Acc: {round(time_ratio * 100, 1)}%")
 
         # --- GOOGLE SHEETS UPSERT LOGIC ---
-        if score >= 90:
+        if score >= 85:
             st.balloons()
             st.success(f"🎉 PASS! You qualified for {selected_song_name} with {score}%!")
 
@@ -181,4 +181,4 @@ if user_id and selected_song_path:
                 st.warning("Your score counts, but we couldn't reach the leaderboard right now. "
                            "(Check that the Google Sheet is shared with the service account email.)")
         else:
-            st.error(f"Score: {score}%. You need 90% to qualify for this song. Try again!")
+            st.error(f"Score: {score}%. You need 85% to qualify for this song. Try again!")
