@@ -378,17 +378,34 @@ if user_id and selected_song_path:
                             [score, "QUALIFIED", timestamp, voice_id, voice_str]
                         saved = True
                 else:
-                    new_data = {
-                        "User ID": user_id,
-                        "Registration ID": st.session_state.registration_id,
-                        "Song": selected_song_name,
-                        "Score": score,
-                        "Status": "QUALIFIED",
-                        "Last Attempt": timestamp,
-                        "Voice ID": voice_id,
-                        "Voice Print": voice_str,
-                    }
-                    df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
+                    # No row yet for this exact song. Reuse the participant's blank roster
+                    # placeholder row (name + Registration ID, but no Song filled in) if one
+                    # exists, so we update it in place instead of leaving a duplicate empty
+                    # row behind. Otherwise append a fresh row for this song.
+                    song_blank = df["Song"].isna() | (
+                        df["Song"].astype(str).str.strip().isin(["", "nan", "None"])
+                    )
+                    placeholder_mask = (df["User ID"] == user_id) & song_blank
+
+                    if placeholder_mask.any():
+                        idx = df[placeholder_mask].index[0]
+                        df.loc[idx, ["Registration ID", "Song", "Score", "Status",
+                                     "Last Attempt", "Voice ID", "Voice Print"]] = [
+                            st.session_state.registration_id, selected_song_name, score,
+                            "QUALIFIED", timestamp, voice_id, voice_str,
+                        ]
+                    else:
+                        new_data = {
+                            "User ID": user_id,
+                            "Registration ID": st.session_state.registration_id,
+                            "Song": selected_song_name,
+                            "Score": score,
+                            "Status": "QUALIFIED",
+                            "Last Attempt": timestamp,
+                            "Voice ID": voice_id,
+                            "Voice Print": voice_str,
+                        }
+                        df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
                     saved = True
 
                 if saved:
