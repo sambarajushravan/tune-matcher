@@ -10,8 +10,8 @@ import datetime
 import pandas as pd
 
 # --- APP CONFIG ---
-st.set_page_config(page_title="Tune Matcher", page_icon="🎤")
-st.title("🎤 Tune Matcher Challenge")
+st.set_page_config(page_title="Sataka Sankharavam Tune Matcher", page_icon="🎤")
+st.title("🎤 Sataka Sankharavam Tune Matcher Challenge")
 st.write("Match the tune and timing at 85% or higher to pass!")
 
 

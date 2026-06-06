@@ -1,0 +1,212 @@
+# Sataka Sankharavam Tune Matcher Challenge
+
+A Streamlit web app where registered participants sing along to reference songs,
+get an automatic match score (pronunciation + tune + timing), and have their
+qualified songs tracked on a Google Sheets leaderboard. Includes a password-gated
+admin panel with stats and a lightweight voice-audit flag for spotting possible
+cheating.
+
+---
+
+## 1. What the app does
+
+1. **Login gate** – A participant must enter their **Name** and **Registration ID**
+   (their "password"). Both are validated against a roster stored in Google Sheets.
+2. **Pick a song** – Songs are loaded dynamically from the `songs/` folder (one
+   `.wav` per song). There are 18 songs.
+3. **Record & score** – The participant records themselves singing. The app compares
+   their recording to the reference and produces an **Overall Match Score (%)**.
+4. **Pass threshold = 85%** – At 85% or higher the attempt is marked `QUALIFIED` and
+   saved to the leaderboard sheet (only if it beats their previous best for that song).
+5. **Progress tracking** – Shows "X out of 18 songs" qualified; celebrates at 18/18.
+6. **Admin panel** – A password-protected expander shows qualification stats,
+   a leaderboard, per-song completion chart, a voice-audit flag, and a raw activity log.
+
+---
+
+## 2. File / folder structure
+
+```
+tune-matcher/
+├── app.py                  # The Streamlit app (main file)
+├── download.py             # yt-dlp helper used to fetch the source YouTube audio
+├── split_songs.py          # Splits the long source audio into 18 verse .wav files
+├── requirements.txt        # Python dependencies (Streamlit Cloud installs these)
+├── packages.txt            # System packages for Streamlit Cloud (ffmpeg)
+├── .gitignore              # Ignores secrets, venvs, the summary PDF, etc.
+├── PROJECT_SUMMARY.md      # This document
+├── songs/                  # The 18 reference .wav files the app plays/compares
+└── .streamlit/
+    └── secrets.toml        # Local secrets (NOT committed – gitignored)
+```
+
+> `secrets.toml`, the virtual environments (`.venv/`, `.venv_test/`), `test_gsheets.py`,
+> and `tune_matcher_summary.pdf` are intentionally git-ignored.
+
+---
+
+## 3. How the score is calculated (`app.py`, sections 1–5)
+
+Audio is loaded at `sr=22050` for both the reference and the user (with a `try/except`
+so iPhone recordings that fail to decode show a friendly error instead of crashing).
+
+**Three feature layers** are extracted with a consistent `hop_length=512`:
+
+| Layer | Feature | Purpose |
+|-------|---------|---------|
+| A | MFCC (z-scored) | Pronunciation / words / vocal-tract timbre |
+| B | Chroma | Musical notes, robust to male/female octave shifts |
+| C | Pitch `f0` via `pyin` (z-scored) | Melody line / shape; stops a totally different song from matching |
+
+The three layers are stacked into one feature matrix for the reference and the user.
+
+**Dynamic Time Warping (DTW)** aligns the two sequences:
+- `metric='euclidean'` (literal value match, stricter than cosine).
+- `global_constraints=True, band_rad=0.1` applies a **Sakoe–Chiba band** so the warp
+  window is ~10% of the song length. This blocks "cheat paths" that let a wrong song
+  meander to a low cost.
+  - Note: `band_rad` is a **fraction** of the longer sequence. `band_rad=10` would be a
+    no-op (band 10× wider than the matrix). Use small fractions like `0.1`.
+
+**Normalized distance:** `norm_dist = D[-1,-1] / len(path)`.
+
+**Anchor-scaling score** (piecewise linear):
+```python
+GOOD_MATCH_DIST = 1.90   # where a correct rendition lands
+PENALTY_SLOPE   = 150.0  # how fast score drops past the anchor
+
+if norm_dist <= GOOD_MATCH_DIST:
+    base_score = 100.0 - ((norm_dist / GOOD_MATCH_DIST) * 5.0)   # ~95–100
+else:
+    base_score = max(0.0, 95.0 - ((norm_dist - GOOD_MATCH_DIST) * PENALTY_SLOPE))
+
+final_score = base_score * time_ratio   # tempo multiplier
+```
+
+**Tempo multiplier (`time_ratio`)** = `min(dur_ref, dur_user) / max(dur_ref, dur_user)`.
+Singing much faster or slower drags the score down.
+
+A NaN/Inf guard clamps the score to `0.0` if anything goes wrong.
+
+### Tuning guide
+- Correct renditions tend to land near `norm_dist ≈ 1.90` (score ~90s).
+- Wrong songs land higher (`≈ 2.15+`) and fall below 50, down to 0.
+- To make passing **harder**: lower `GOOD_MATCH_DIST` or raise `PENALTY_SLOPE`.
+- To make passing **easier**: raise `GOOD_MATCH_DIST` or lower `PENALTY_SLOPE`.
+- The pass threshold itself (`85`) appears in three places in `app.py`: the intro
+  caption, the `if score >= 85` check, and the failure message. Change all three together.
+
+---
+
+## 4. Google Sheets integration
+
+Connection uses `streamlit-gsheets` (`st.connection("gsheets", type=GSheetsConnection)`)
+backed by a Google **service account**. The Sheet must be **shared** with the service
+account's email (found in `secrets.toml`) or reads/writes fail.
+
+### Sheet columns (header row, exactly these names)
+```
+User ID | Registration ID | Song | Score | Status | Last Attempt | Voice ID | Voice Print
+```
+
+- **User ID** – Participant's name (used as the roster name AND the leaderboard key).
+- **Registration ID** – The participant's "password". Pre-fill this column in the roster
+  for everyone allowed to log in.
+- **Song / Score / Status / Last Attempt** – Filled in when someone qualifies.
+  `Status` is set to `QUALIFIED`.
+- **Voice ID / Voice Print** – Auto-filled (see section 6). The app creates these columns
+  automatically if missing, but it's fine to add them yourself.
+
+### Login matching (forgiving)
+- **Name**: case-insensitive and whitespace-insensitive (`"Sahitya   Malladi"` ==
+  `"sahitya malladi"`). Extra spaces between first/last name don't matter.
+- **Registration ID**: case-insensitive, all whitespace removed.
+
+### Upsert rules
+- One row per `(User ID, Song)`.
+- If a row already exists and is `QUALIFIED`, it's only overwritten when the **new score
+  is higher** than the stored best. Otherwise the previous best is kept.
+- New `(User ID, Song)` combos are appended as new rows.
+
+---
+
+## 5. Admin panel
+
+- Lives in an expander labeled **"📊 Admin Reports & Statistics"** and is always rendered
+  (even before participant login).
+- Gated by `st.secrets["admin"]["password"]`. If that secret is missing, it shows a clear
+  configuration message instead of crashing.
+- Shows, for `QUALIFIED` rows only:
+  - Total qualifications + unique active users.
+  - Leaderboard (songs completed per user).
+  - Bar chart of completion rate per song.
+  - **Voice Audit** (section 6).
+  - Raw activity log (Voice Print column hidden for readability).
+
+---
+
+## 6. Voice ID & Voice Print (anti-cheating heuristic)
+
+> This is a **best-effort review flag, NOT biometric verification.** Only the
+> Name + Registration ID are required to log in and qualify. The voice data exists
+> purely so an admin can spot the same person qualifying under different names.
+
+- **Voice Print** – A compact numeric "fingerprint" of the singer's timbre: the mean and
+  standard deviation of the MFCCs, L2-normalized, stored as a comma-separated string.
+- **Voice ID** – A human-readable label (`Voice 1`, `Voice 2`, …). When someone qualifies,
+  the app compares their voice print to all stored prints using cosine similarity. If it's
+  very similar (≥ `VOICE_MATCH_THRESHOLD = 0.98`) to an existing one, that **same Voice ID**
+  is reused; otherwise a new `Voice N` label is minted.
+- **Voice Audit** – In the admin panel, if one `Voice ID` is attached to **more than one**
+  `User ID`, it's flagged in red as a possible same-singer-across-names case.
+
+Caveats: the print is content-dependent (it reacts to which song/words were sung, not
+just the voice), so similarity thresholds are approximate. Treat flags as "look into this",
+not proof.
+
+---
+
+## 7. Preparing the songs
+
+1. **Download source audio** (`download.py`): uses `yt-dlp` + `ffmpeg` to pull the audio
+   from the source YouTube video into `songs/`.
+2. **Split into verses** (`split_songs.py`): uses `ffmpeg` with hardcoded `(start_time,
+   filename)` cut points (derived from the video captions) to produce the 18 individual
+   `.wav` files. A verse ends when the lyric ends with "sumati" or "vinura vema".
+
+To add/replace songs later: drop new `.wav` files into `songs/`. The selectbox lists them
+automatically (sorted by filename; the display name is the filename without `.wav`).
+
+---
+
+## 8. Deployment (Streamlit Community Cloud)
+
+- Push the repo to GitHub. Streamlit Cloud builds from `requirements.txt` (Python deps:
+  `streamlit`, `librosa`, `numpy`, `soundfile`, `audioread`, `audio-recorder-streamlit`,
+  `st-gsheets-connection`, etc.) and `packages.txt` (system deps: `ffmpeg`).
+- **Secrets are NOT committed.** In the Streamlit Cloud app settings, paste the contents of
+  your local `.streamlit/secrets.toml`, including:
+  - `[connections.gsheets]` with the **real spreadsheet URL**, worksheet name, and the full
+    service-account credentials block.
+  - `[admin] password = "..."`.
+- Common failure: `SpreadsheetNotFound` / 404 → the spreadsheet URL is wrong/placeholder, or
+  the Sheet isn't shared with the service-account email.
+
+### Local run
+```bash
+cd tune-matcher
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+# create .streamlit/secrets.toml with real values
+streamlit run app.py
+```
+
+---
+
+## 9. Git / commit conventions
+
+Commit author should be:
+```
+Phani Prasad Vinnakota Rajendra <vrppinvictaralabs@gmail.com>
+```
+Never commit `secrets.toml`, virtual environments, or the summary PDF (all gitignored).
