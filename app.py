@@ -5,6 +5,7 @@ from audio_recorder_streamlit import audio_recorder
 from streamlit_gsheets import GSheetsConnection
 import io
 import os
+import re
 import datetime
 import pandas as pd
 
@@ -13,8 +14,202 @@ st.set_page_config(page_title="Tune Matcher", page_icon="🎤")
 st.title("🎤 Tune Matcher Challenge")
 st.write("Match the tune and timing at 85% or higher to pass!")
 
-# 1. User Info
-user_id = st.text_input("Enter your Name or ID:", "")
+
+# --- NORMALIZATION HELPERS (for forgiving login matching) ---
+def _norm_name(value):
+    """Lowercase + collapse any run of whitespace to a single space + strip.
+    So 'Sahitya   Malladi' == 'sahitya malladi'."""
+    return " ".join(str(value).split()).lower()
+
+
+def _norm_pwd(value):
+    """Lowercase + remove all whitespace, so case and stray spaces don't matter."""
+    return "".join(str(value).split()).lower()
+
+
+def authenticate(username, password):
+    """Validate name + Registration ID against the roster in the sheet.
+    Returns (canonical_user_id, registration_id) on success, else None."""
+    conn = st.connection("gsheets", type=GSheetsConnection)
+    roster = conn.read(ttl=0).dropna(how="all")
+    if "User ID" not in roster.columns or "Registration ID" not in roster.columns:
+        return None
+
+    target_name = _norm_name(username)
+    target_pwd = _norm_pwd(password)
+
+    for _, row in roster.iterrows():
+        reg = row.get("Registration ID")
+        if reg is None or str(reg).strip() == "":
+            continue  # skip rows without a Registration ID
+        if _norm_name(row["User ID"]) == target_name and _norm_pwd(reg) == target_pwd:
+            return str(row["User ID"]).strip(), str(reg).strip()
+    return None
+
+
+# --- VOICE FINGERPRINT HELPERS (best-effort, for admin duplicate-singer review) ---
+# NOTE: this is a lightweight timbre signature (MFCC mean+std), NOT biometric-grade
+# speaker verification. It is content-dependent, so treat it as an admin review flag.
+VOICE_MATCH_THRESHOLD = 0.98  # cosine similarity above which two prints are "same voice"
+
+
+def _voice_signature(mfcc):
+    """Compact, L2-normalized timbre signature from MFCC mean + std over time."""
+    sig = np.concatenate([mfcc.mean(axis=1), mfcc.std(axis=1)])
+    norm = np.linalg.norm(sig)
+    return sig / norm if norm > 0 else sig
+
+
+def _voice_to_str(sig):
+    return ",".join(f"{x:.4f}" for x in sig)
+
+
+def _parse_voice(text):
+    try:
+        arr = np.array([float(x) for x in str(text).split(",") if x.strip() != ""])
+        return arr if arr.size else None
+    except Exception:
+        return None
+
+
+def _assign_voice_id(df, new_sig):
+    """Nearest-neighbour match against stored Voice Prints.
+    Returns (voice_id, matched_user_id_or_None). Reuses an existing Voice ID if a very
+    similar print exists, otherwise mints the next 'Voice N' label."""
+    best_sim, best_id, best_user = -1.0, None, None
+    max_n = 0
+    if "Voice ID" in df.columns and "Voice Print" in df.columns:
+        for _, r in df.iterrows():
+            vid = str(r.get("Voice ID", "")).strip()
+            if vid:
+                m = re.match(r"[Vv]oice\s+(\d+)", vid)
+                if m:
+                    max_n = max(max_n, int(m.group(1)))
+            vp = _parse_voice(r.get("Voice Print", ""))
+            if vp is not None and vp.shape == new_sig.shape:
+                sim = float(np.dot(vp, new_sig))  # both L2-normalized => cosine similarity
+                if sim > best_sim:
+                    best_sim, best_id, best_user = sim, vid, str(r.get("User ID", "")).strip()
+    if best_id and best_sim >= VOICE_MATCH_THRESHOLD:
+        return best_id, best_user
+    return f"Voice {max_n + 1}", None
+
+
+# --- 1. LOGIN GATE ---
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+    st.session_state.user_id = None
+    st.session_state.registration_id = None
+
+if not st.session_state.authenticated:
+    st.subheader("🔐 Participant Login")
+    with st.form("login_form"):
+        login_name = st.text_input("Name (as registered):")
+        login_pwd = st.text_input("Registration ID:", type="password")
+        submitted = st.form_submit_button("Login")
+
+    if submitted:
+        try:
+            result = authenticate(login_name, login_pwd)
+        except Exception:
+            st.error("Could not reach the registration list right now. Please try again in a moment.")
+        else:
+            if result:
+                st.session_state.authenticated = True
+                st.session_state.user_id = result[0]
+                st.session_state.registration_id = result[1]
+                st.rerun()
+            else:
+                st.error("Name or Registration ID is incorrect. Please check and try again.")
+
+# --- ADMIN REPORTING SECTION (always available, gated by its own password) ---
+st.write("---")
+with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
+    admin_password = st.text_input("Enter Admin Password:", type="password")
+
+    if admin_password:
+        # Fetch the password safely from Streamlit's secrets manager. Guard against a
+        # missing [admin] secret or a Sheets read failure so the panel never hard-crashes.
+        try:
+            correct_password = st.secrets["admin"]["password"]
+        except (KeyError, FileNotFoundError):
+            st.error("Admin password is not configured. Add an [admin] password to the app secrets.")
+            correct_password = None
+
+        if correct_password is None:
+            pass
+        elif admin_password == correct_password:
+            st.success("Access Granted! Fetching real-time reports...")
+
+            try:
+                conn = st.connection("gsheets", type=GSheetsConnection)
+                admin_df = conn.read(ttl=0).dropna(how="all")
+
+                # Only completed passes count toward stats (skips blank roster rows).
+                if "Status" in admin_df.columns:
+                    passes_df = admin_df[admin_df["Status"] == "QUALIFIED"]
+                else:
+                    passes_df = admin_df.iloc[0:0]
+
+                if not passes_df.empty:
+                    total_passes = len(passes_df)
+                    unique_singers = passes_df["User ID"].nunique()
+
+                    col1, col2 = st.columns(2)
+                    col1.metric("Total Qualifications Logged", total_passes)
+                    col2.metric("Total Unique Active Users", unique_singers)
+
+                    st.subheader("🏆 Top Participant Progress")
+                    leaderboard = passes_df["User ID"].value_counts().reset_index()
+                    leaderboard.columns = ["User ID", "Songs Completed (Out of 18)"]
+                    st.dataframe(leaderboard, use_container_width=True)
+
+                    st.subheader("🎵 Completion Rates by Song")
+                    song_counts = passes_df["Song"].value_counts()
+                    st.bar_chart(song_counts)
+
+                    # Voice Audit: flag a single voice qualifying under multiple usernames.
+                    st.subheader("🕵️ Voice Audit (possible same singer across names)")
+                    if "Voice ID" in passes_df.columns:
+                        va = passes_df[passes_df["Voice ID"].astype(str).str.strip() != ""]
+                        if not va.empty:
+                            grouped = va.groupby("Voice ID")["User ID"].nunique()
+                            flagged = grouped[grouped > 1]
+                            if not flagged.empty:
+                                for vid, n in flagged.items():
+                                    users = sorted(va[va["Voice ID"] == vid]["User ID"].unique())
+                                    st.error(f"{vid}: same voice qualified under {n} names → {', '.join(users)}")
+                            else:
+                                st.success("No duplicate voices detected across different users.")
+                        else:
+                            st.info("No voice fingerprints recorded yet.")
+                    else:
+                        st.info("No voice fingerprints recorded yet.")
+
+                    st.subheader("📋 Raw Activity Log")
+                    log_cols = [c for c in passes_df.columns if c != "Voice Print"]
+                    st.dataframe(passes_df[log_cols].sort_values(by="Last Attempt", ascending=False), use_container_width=True)
+                else:
+                    st.info("No qualifications logged yet. No stats to report.")
+            except Exception as e:
+                st.error("Could not load reports from Google Sheets right now. Please try again later.")
+        else:
+            st.error("Incorrect Password.")
+
+# Stop here until the participant logs in (admin panel above still renders).
+if not st.session_state.authenticated:
+    st.stop()
+
+# --- AUTHENTICATED PARTICIPANT FLOW ---
+user_id = st.session_state.user_id
+
+header_col, logout_col = st.columns([3, 1])
+header_col.success(f"Logged in as: {user_id}")
+if logout_col.button("Log out"):
+    st.session_state.authenticated = False
+    st.session_state.user_id = None
+    st.session_state.registration_id = None
+    st.rerun()
 
 # --- DYNAMIC SONG LOADING ---
 SONG_DIR = "songs"
@@ -36,7 +231,7 @@ else:
 
 if user_id and selected_song_path:
     st.audio(selected_song_path)
-    
+
     st.write("Click the mic and start singing!")
     audio_bytes = audio_recorder(text="Click to record", pause_threshold=2.0)
 
@@ -58,7 +253,7 @@ if user_id and selected_song_path:
 
             # --- 3. PRONUNCIATION, TUNE, & MELODY MATCHING ---
             hop_len = 512
-            
+
             # Layer A: Pronunciation (MFCC)
             mfcc_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13, hop_length=hop_len)
             mfcc_user = librosa.feature.mfcc(y=y_user, sr=sr_user, n_mfcc=13, hop_length=hop_len)
@@ -78,7 +273,7 @@ if user_id and selected_song_path:
             # Normalize Pitch so Male vs Female doesn't fail (Tracks relative melody path)
             f0_ref_norm = (f0_ref - np.mean(f0_ref)) / (np.std(f0_ref) + 1e-6) if np.std(f0_ref) > 0 else f0_ref
             f0_user_norm = (f0_user - np.mean(f0_user)) / (np.std(f0_user) + 1e-6) if np.std(f0_user) > 0 else f0_user
-            
+
             f0_ref_norm = f0_ref_norm.reshape(1, -1)
             f0_user_norm = f0_user_norm.reshape(1, -1)
 
@@ -121,10 +316,10 @@ if user_id and selected_song_path:
                 base_score = 100.0 - ((norm_dist / GOOD_MATCH_DIST) * 5.0)
             else:
                 base_score = max(0.0, 95.0 - ((norm_dist - GOOD_MATCH_DIST) * PENALTY_SLOPE))
-            
+
             # Apply tempo accuracy multiplier
             final_score = base_score * time_ratio
-            
+
             # Safe NaN / Infinity boundary protection
             if np.isnan(final_score) or np.isinf(final_score):
                 score = 0.0
@@ -133,6 +328,9 @@ if user_id and selected_song_path:
 
             st.metric("Overall Match Score", f"{score}%")
             st.caption(f"Raw Dist: {round(norm_dist, 2)} | Tempo Acc: {round(time_ratio * 100, 1)}%")
+
+            # Rough timbre fingerprint of this recording (used only if they qualify)
+            voice_sig = _voice_signature(mfcc_user)
 
         # --- GOOGLE SHEETS UPSERT LOGIC ---
         if score >= 85:
@@ -143,7 +341,8 @@ if user_id and selected_song_path:
             # unreachable/misconfigured, the user still sees their passing score.
             try:
                 conn = st.connection("gsheets", type=GSheetsConnection)
-                expected_columns = ["User ID", "Song", "Score", "Status", "Last Attempt"]
+                expected_columns = ["User ID", "Registration ID", "Song", "Score",
+                                    "Status", "Last Attempt", "Voice ID", "Voice Print"]
 
                 df = conn.read(ttl=0)
                 df = df.dropna(how="all")
@@ -153,22 +352,48 @@ if user_id and selected_song_path:
                         df[col] = pd.Series(dtype="object")
 
                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-                new_data = {
-                    "User ID": user_id,
-                    "Song": selected_song_name,
-                    "Score": score,
-                    "Status": "QUALIFIED",
-                    "Last Attempt": timestamp,
-                }
 
+                # Voice label for this recording (rough timbre match for admin auditing)
+                voice_id, _matched_user = _assign_voice_id(df, voice_sig)
+                voice_str = _voice_to_str(voice_sig)
+
+                # One row per (User ID, Song). Update only the matching row.
                 mask = (df["User ID"] == user_id) & (df["Song"] == selected_song_name)
 
+                saved = False
                 if mask.any():
-                    df.loc[mask, ["Score", "Last Attempt"]] = [score, timestamp]
-                else:
-                    df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
+                    # Existing attempt for this song: keep the best score only.
+                    prev_raw = df.loc[mask, "Score"].iloc[0]
+                    try:
+                        prev_score = float(prev_raw)
+                    except (TypeError, ValueError):
+                        prev_score = None
+                    prev_status = str(df.loc[mask, "Status"].iloc[0]).strip()
 
-                conn.update(data=df)
+                    if prev_status == "QUALIFIED" and prev_score is not None and score <= prev_score:
+                        st.info(f"Your previous best for this song ({prev_score}%) is kept — "
+                                f"this attempt ({score}%) wasn't higher.")
+                    else:
+                        df.loc[mask, ["Score", "Status", "Last Attempt", "Voice ID", "Voice Print"]] = \
+                            [score, "QUALIFIED", timestamp, voice_id, voice_str]
+                        saved = True
+                else:
+                    new_data = {
+                        "User ID": user_id,
+                        "Registration ID": st.session_state.registration_id,
+                        "Song": selected_song_name,
+                        "Score": score,
+                        "Status": "QUALIFIED",
+                        "Last Attempt": timestamp,
+                        "Voice ID": voice_id,
+                        "Voice Print": voice_str,
+                    }
+                    df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
+                    saved = True
+
+                if saved:
+                    conn.update(data=df)
+                    st.success("New best score saved!")
 
                 user_progress = df[df["User ID"] == user_id]
                 songs_passed = len(user_progress[user_progress["Status"] == "QUALIFIED"])
@@ -182,58 +407,3 @@ if user_id and selected_song_path:
                            "(Check that the Google Sheet is shared with the service account email.)")
         else:
             st.error(f"Score: {score}%. You need 85% to qualify for this song. Try again!")
-
-# --- OPTIONAL: ADMIN REPORTING SECTION ---
-st.write("---")
-with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
-    admin_password = st.text_input("Enter Admin Password:", type="password")
-
-    if admin_password:
-        # THE SECURE FIX: Fetch the password safely from Streamlit's secrets manager.
-        # Guard against a missing [admin] secret (e.g. not configured on Streamlit Cloud)
-        # or a Sheets read failure so the admin panel never hard-crashes the app.
-        try:
-            correct_password = st.secrets["admin"]["password"]
-        except (KeyError, FileNotFoundError):
-            st.error("Admin password is not configured. Add an [admin] password to the app secrets.")
-            correct_password = None
-
-        if correct_password is None:
-            pass
-        elif admin_password == correct_password:
-            st.success("Access Granted! Fetching real-time reports...")
-
-            try:
-                # Connect and read fresh data from the sheet
-                conn = st.connection("gsheets", type=GSheetsConnection)
-                admin_df = conn.read(ttl=0).dropna(how="all")
-
-                if not admin_df.empty:
-                    # Metric Summary Cards
-                    total_passes = len(admin_df)
-                    unique_singers = admin_df["User ID"].nunique()
-
-                    col1, col2 = st.columns(2)
-                    col1.metric("Total Qualifications Logged", total_passes)
-                    col2.metric("Total Unique Active Users", unique_singers)
-
-                    # Leaderboard Chart
-                    st.subheader("🏆 Top Participant Progress")
-                    leaderboard = admin_df["User ID"].value_counts().reset_index()
-                    leaderboard.columns = ["User ID", "Songs Completed (Out of 18)"]
-                    st.dataframe(leaderboard, use_container_width=True)
-
-                    # Song Difficulty Chart
-                    st.subheader("🎵 Completion Rates by Song")
-                    song_counts = admin_df["Song"].value_counts()
-                    st.bar_chart(song_counts)
-
-                    # Raw Data Viewer
-                    st.subheader("📋 Raw Activity Log")
-                    st.dataframe(admin_df.sort_values(by="Last Attempt", ascending=False), use_container_width=True)
-                else:
-                    st.info("The database sheet is currently empty. No stats to report yet!")
-            except Exception as e:
-                st.error("Could not load reports from Google Sheets right now. Please try again later.")
-        else:
-            st.error("Incorrect Password.")
