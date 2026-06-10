@@ -213,6 +213,11 @@ if logout_col.button("Log out"):
 
 # --- DYNAMIC SONG LOADING ---
 SONG_DIR = "songs"
+# The final test is a single combined track of all 18 songs in sequence. It lives
+# outside SONG_DIR so it is not listed as just another individual song.
+FINAL_TEST_PATH = os.path.join("final", "all_songs.wav")
+FINAL_TEST_LABEL = "🏆 FINAL TEST — Sing All 18 Songs in Sequence"
+FINAL_TEST_KEY = "FINAL_TEST_ALL_SONGS"  # how the final test row is stored in the sheet
 
 if os.path.exists(SONG_DIR):
     available_songs = {f.replace('.wav', ''): os.path.join(SONG_DIR, f)
@@ -221,11 +226,32 @@ else:
     available_songs = {}
     st.error("Songs directory not found! Please check your GitHub folder structure.")
 
-# 2. Song Selection
+# 2. Song Selection (the final test, if present, is always offered last)
 selected_song_path = None
-if available_songs:
-    selected_song_name = st.selectbox("Choose a song to practice:", list(available_songs.keys()))
-    selected_song_path = available_songs[selected_song_name]
+is_final_test = False
+song_key = None       # value stored in the sheet's "Song" column
+display_name = None   # friendly name used in user-facing messages
+
+options = list(available_songs.keys())
+if os.path.exists(FINAL_TEST_PATH):
+    options.append(FINAL_TEST_LABEL)
+
+if options:
+    selected_song_name = st.selectbox("Choose a song to practice:", options)
+    if selected_song_name == FINAL_TEST_LABEL:
+        is_final_test = True
+        selected_song_path = FINAL_TEST_PATH
+        song_key = FINAL_TEST_KEY
+        display_name = "the Final Test (all 18 songs)"
+        st.warning(
+            "🏆 **Final Test:** sing all 18 songs one after another, in the same order "
+            "as the reference, keeping pace with it. This is the full ~6 minute sequence — "
+            "play the reference first to follow along."
+        )
+    else:
+        selected_song_path = available_songs[selected_song_name]
+        song_key = selected_song_name
+        display_name = selected_song_name
 else:
     st.warning("No songs found in the /songs folder.")
 
@@ -252,7 +278,10 @@ if user_id and selected_song_path:
             time_ratio = min(duration_ref, duration_user) / max(duration_ref, duration_user)
 
             # --- 3. PRONUNCIATION, TUNE, & MELODY MATCHING ---
-            hop_len = 512
+            # A short song (~20s) uses a fine hop. The final test is ~6 minutes, and at
+            # hop=512 the DTW cost matrix (frames x frames) would be ~2 GB and crash the
+            # app. Use a coarser hop above ~90s to keep the matrix bounded.
+            hop_len = 512 if max(duration_ref, duration_user) <= 90 else 2048
 
             # Layer A: Pronunciation (MFCC)
             mfcc_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13, hop_length=hop_len)
@@ -335,7 +364,7 @@ if user_id and selected_song_path:
         # --- GOOGLE SHEETS UPSERT LOGIC ---
         if score >= 85:
             st.balloons()
-            st.success(f"🎉 PASS! You qualified for {selected_song_name} with {score}%!")
+            st.success(f"🎉 PASS! You qualified for {display_name} with {score}%!")
 
             # Saving to the leaderboard must never crash the app: if the Sheet is
             # unreachable/misconfigured, the user still sees their passing score.
@@ -358,7 +387,7 @@ if user_id and selected_song_path:
                 voice_str = _voice_to_str(voice_sig)
 
                 # One row per (User ID, Song). Update only the matching row.
-                mask = (df["User ID"] == user_id) & (df["Song"] == selected_song_name)
+                mask = (df["User ID"] == user_id) & (df["Song"] == song_key)
 
                 saved = False
                 if mask.any():
@@ -391,14 +420,14 @@ if user_id and selected_song_path:
                         idx = df[placeholder_mask].index[0]
                         df.loc[idx, ["Registration ID", "Song", "Score", "Status",
                                      "Last Attempt", "Voice ID", "Voice Print"]] = [
-                            st.session_state.registration_id, selected_song_name, score,
+                            st.session_state.registration_id, song_key, score,
                             "QUALIFIED", timestamp, voice_id, voice_str,
                         ]
                     else:
                         new_data = {
                             "User ID": user_id,
                             "Registration ID": st.session_state.registration_id,
-                            "Song": selected_song_name,
+                            "Song": song_key,
                             "Score": score,
                             "Status": "QUALIFIED",
                             "Last Attempt": timestamp,
@@ -413,14 +442,21 @@ if user_id and selected_song_path:
                     st.success("New best score saved!")
 
                 user_progress = df[df["User ID"] == user_id]
-                songs_passed = len(user_progress[user_progress["Status"] == "QUALIFIED"])
-                st.info(f"Progress: You have qualified for {songs_passed} out of 18 songs!")
+                qualified = user_progress[user_progress["Status"] == "QUALIFIED"]
+                # The final test is not one of the 18 songs, so exclude it from the tally.
+                songs_passed = len(qualified[qualified["Song"] != FINAL_TEST_KEY])
 
-                if songs_passed == 18:
+                if is_final_test:
                     st.snow()
-                    st.success("🏆 AMAZING! You have qualified for ALL 18 songs!")
+                    st.success("🏆 CONGRATULATIONS! You passed the FINAL TEST — "
+                               "all 18 songs sung in sequence!")
+                else:
+                    st.info(f"Progress: You have qualified for {songs_passed} out of 18 songs!")
+                    if songs_passed == 18:
+                        st.snow()
+                        st.success("🏆 AMAZING! You have qualified for ALL 18 songs!")
             except Exception as e:
                 st.warning("Your score counts, but we couldn't reach the leaderboard right now. "
                            "(Check that the Google Sheet is shared with the service account email.)")
         else:
-            st.error(f"Score: {score}%. You need 85% to qualify for this song. Try again!")
+            st.error(f"Score: {score}%. You need 85% to qualify for {display_name}. Try again!")
