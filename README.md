@@ -18,7 +18,7 @@ This application allows users to test their singing accuracy against 18 referenc
 * **Language:** Python 3.11+
 * **Frontend:** [Streamlit](https://streamlit.io/)
 * **Audio Engine:** [Librosa](https://librosa.org/) (Digital Signal Processing)
-* **Data Store:** Google Sheets (via `st-gsheets-connection`)
+* **Data Store:** Google Sheets (via `gspread` + `google-auth`)
 * **Hosting:** Streamlit Community Cloud
 
 ---

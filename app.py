@@ -2,7 +2,8 @@ import streamlit as st
 import librosa
 import numpy as np
 from audio_recorder_streamlit import audio_recorder
-from streamlit_gsheets import GSheetsConnection
+import gspread
+from google.oauth2.service_account import Credentials
 import io
 import os
 import re
@@ -13,6 +14,49 @@ import pandas as pd
 st.set_page_config(page_title="Sataka Sankharavam Tune Matcher", page_icon="🎤")
 st.title("🎤 Sataka Sankharavam Tune Matcher Challenge")
 st.write("Match the tune and timing at 85% or higher to pass!")
+
+
+# --- GOOGLE SHEETS BACKEND (gspread, lightweight reads/writes) ---
+# We talk to the sheet directly with gspread instead of rewriting the whole sheet on
+# every save. This keeps memory/API usage low and avoids "two people qualify at once
+# overwrites one row" (lost updates), which the old read-all/write-all pattern risked.
+# NOTE: the sheet columns MUST stay in this exact left-to-right order (A..H), because
+# row writes target the A:H range positionally.
+SHEET_COLUMNS = ["User ID", "Registration ID", "Song", "Score",
+                 "Status", "Last Attempt", "Voice ID", "Voice Print"]
+
+
+@st.cache_resource(show_spinner=False)
+def _get_worksheet():
+    """Authorize a gspread worksheet handle from the service-account secrets.
+    Cached as a resource so we authorize once per app process (not per rerun)."""
+    cfg = dict(st.secrets["connections"]["gsheets"])
+    spreadsheet_url = cfg.pop("spreadsheet")
+    worksheet_name = cfg.pop("worksheet", "Sheet1")
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(cfg, scopes=scopes)
+    client = gspread.authorize(creds)
+    return client.open_by_url(spreadsheet_url).worksheet(worksheet_name)
+
+
+def _read_records():
+    """Live read of the whole sheet as a list of header-keyed dicts (1 API call)."""
+    return _get_worksheet().get_all_records()
+
+
+def _final_test_enabled():
+    """Final Test (all-songs combined) is OFF unless [features] final_test is truthy
+    in secrets. Lets you turn it on/off on demand without a code change."""
+    try:
+        val = st.secrets["features"]["final_test"]
+    except (KeyError, FileNotFoundError):
+        return False
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(val)
 
 
 # --- NORMALIZATION HELPERS (for forgiving login matching) ---
@@ -27,23 +71,29 @@ def _norm_pwd(value):
     return "".join(str(value).split()).lower()
 
 
-def authenticate(username, password):
-    """Validate name + Registration ID against the roster in the sheet.
-    Returns (canonical_user_id, registration_id) on success, else None."""
-    conn = st.connection("gsheets", type=GSheetsConnection)
-    roster = conn.read(ttl=0).dropna(how="all")
-    if "User ID" not in roster.columns or "Registration ID" not in roster.columns:
-        return None
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_roster():
+    """Cached list of (normalized_name, normalized_pwd, canonical_name, reg_id).
+    Refreshes every 5 minutes and is shared across all sessions, so we don't re-read
+    the whole sheet on every single login attempt. Trade-off: a participant added to
+    the roster mid-event may take up to 5 minutes to be able to log in."""
+    roster = []
+    for r in _read_records():
+        name = str(r.get("User ID", "")).strip()
+        reg = str(r.get("Registration ID", "")).strip()
+        if name and reg:
+            roster.append((_norm_name(name), _norm_pwd(reg), name, reg))
+    return roster
 
+
+def authenticate(username, password):
+    """Validate name + Registration ID against the cached roster.
+    Returns (canonical_user_id, registration_id) on success, else None."""
     target_name = _norm_name(username)
     target_pwd = _norm_pwd(password)
-
-    for _, row in roster.iterrows():
-        reg = row.get("Registration ID")
-        if reg is None or str(reg).strip() == "":
-            continue  # skip rows without a Registration ID
-        if _norm_name(row["User ID"]) == target_name and _norm_pwd(reg) == target_pwd:
-            return str(row["User ID"]).strip(), str(reg).strip()
+    for norm_name, norm_pwd, canonical_name, reg_id in _get_roster():
+        if norm_name == target_name and norm_pwd == target_pwd:
+            return canonical_name, reg_id
     return None
 
 
@@ -95,6 +145,85 @@ def _assign_voice_id(df, new_sig):
     return f"Voice {max_n + 1}", None
 
 
+def _save_qualification(user_id, reg_id, song_key, score, voice_sig,
+                        is_final_test, final_key):
+    """Upsert a qualifying result with a targeted write (update one row or append one
+    row) instead of rewriting the whole sheet.
+
+    Returns (saved, prev_score, songs_passed):
+      - saved=True  -> row was written (new best / new song / placeholder filled)
+      - saved=False -> kept the existing higher score; prev_score is that score
+      - songs_passed -> distinct individual songs (final test excluded) now qualified
+    Raises on any Sheets failure so the caller can show a friendly warning."""
+    ws = _get_worksheet()
+    records = ws.get_all_records()
+
+    # Build a DataFrame purely so the existing voice-id helper can scan prior prints.
+    df = pd.DataFrame(records)
+    for col in SHEET_COLUMNS:
+        if col not in df.columns:
+            df[col] = pd.Series(dtype="object")
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    voice_id, _matched_user = _assign_voice_id(df, voice_sig)
+    voice_str = _voice_to_str(voice_sig)
+
+    def _row_values(reg):
+        return [user_id, reg, song_key, score, "QUALIFIED", timestamp, voice_id, voice_str]
+
+    # Find an existing (user, song) row, else a blank placeholder row for this user.
+    existing_i, placeholder_i = None, None
+    for i, r in enumerate(records):
+        ru = str(r.get("User ID", "")).strip()
+        rs = str(r.get("Song", "")).strip()
+        if ru == user_id and rs == song_key:
+            existing_i = i
+            break
+    if existing_i is None:
+        for i, r in enumerate(records):
+            ru = str(r.get("User ID", "")).strip()
+            rs = str(r.get("Song", "")).strip()
+            if ru == user_id and rs in ("", "nan", "None"):
+                placeholder_i = i
+                break
+
+    saved = True
+    prev_score = None
+    if existing_i is not None:
+        prev = records[existing_i]
+        try:
+            prev_score = float(prev.get("Score"))
+        except (TypeError, ValueError):
+            prev_score = None
+        prev_status = str(prev.get("Status", "")).strip()
+        if prev_status == "QUALIFIED" and prev_score is not None and score <= prev_score:
+            saved = False  # existing best is higher; leave the row untouched
+        else:
+            reg = str(prev.get("Registration ID", "")).strip() or reg_id
+            row_num = existing_i + 2  # +1 header row, +1 for 1-based indexing
+            ws.update(range_name=f"A{row_num}:H{row_num}",
+                      values=[_row_values(reg)], value_input_option="RAW")
+    elif placeholder_i is not None:
+        row_num = placeholder_i + 2
+        ws.update(range_name=f"A{row_num}:H{row_num}",
+                  values=[_row_values(reg_id)], value_input_option="RAW")
+    else:
+        ws.append_row(_row_values(reg_id), value_input_option="RAW")
+
+    # Distinct individual songs (exclude the final test) this user has qualified for.
+    qualified_songs = set()
+    for r in records:
+        if (str(r.get("User ID", "")).strip() == user_id
+                and str(r.get("Status", "")).strip() == "QUALIFIED"):
+            s = str(r.get("Song", "")).strip()
+            if s and s != final_key:
+                qualified_songs.add(s)
+    if not is_final_test:
+        qualified_songs.add(song_key)  # idempotent if it was already counted
+
+    return saved, prev_score, len(qualified_songs)
+
+
 # --- 1. LOGIN GATE ---
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -142,8 +271,7 @@ with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
             st.success("Access Granted! Fetching real-time reports...")
 
             try:
-                conn = st.connection("gsheets", type=GSheetsConnection)
-                admin_df = conn.read(ttl=0).dropna(how="all")
+                admin_df = pd.DataFrame(_read_records())
 
                 # Only completed passes count toward stats (skips blank roster rows).
                 if "Status" in admin_df.columns:
@@ -233,7 +361,9 @@ song_key = None       # value stored in the sheet's "Song" column
 display_name = None   # friendly name used in user-facing messages
 
 options = list(available_songs.keys())
-if os.path.exists(FINAL_TEST_PATH):
+# Final Test is only offered when its combined track exists AND it is enabled in
+# secrets ([features] final_test = true). Off by default; enable on demand.
+if os.path.exists(FINAL_TEST_PATH) and _final_test_enabled():
     options.append(FINAL_TEST_LABEL)
 
 if options:
@@ -369,82 +499,21 @@ if user_id and selected_song_path:
             # Saving to the leaderboard must never crash the app: if the Sheet is
             # unreachable/misconfigured, the user still sees their passing score.
             try:
-                conn = st.connection("gsheets", type=GSheetsConnection)
-                expected_columns = ["User ID", "Registration ID", "Song", "Score",
-                                    "Status", "Last Attempt", "Voice ID", "Voice Print"]
-
-                df = conn.read(ttl=0)
-                df = df.dropna(how="all")
-
-                for col in expected_columns:
-                    if col not in df.columns:
-                        df[col] = pd.Series(dtype="object")
-
-                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-
-                # Voice label for this recording (rough timbre match for admin auditing)
-                voice_id, _matched_user = _assign_voice_id(df, voice_sig)
-                voice_str = _voice_to_str(voice_sig)
-
-                # One row per (User ID, Song). Update only the matching row.
-                mask = (df["User ID"] == user_id) & (df["Song"] == song_key)
-
-                saved = False
-                if mask.any():
-                    # Existing attempt for this song: keep the best score only.
-                    prev_raw = df.loc[mask, "Score"].iloc[0]
-                    try:
-                        prev_score = float(prev_raw)
-                    except (TypeError, ValueError):
-                        prev_score = None
-                    prev_status = str(df.loc[mask, "Status"].iloc[0]).strip()
-
-                    if prev_status == "QUALIFIED" and prev_score is not None and score <= prev_score:
-                        st.info(f"Your previous best for this song ({prev_score}%) is kept — "
-                                f"this attempt ({score}%) wasn't higher.")
-                    else:
-                        df.loc[mask, ["Score", "Status", "Last Attempt", "Voice ID", "Voice Print"]] = \
-                            [score, "QUALIFIED", timestamp, voice_id, voice_str]
-                        saved = True
-                else:
-                    # No row yet for this exact song. Reuse the participant's blank roster
-                    # placeholder row (name + Registration ID, but no Song filled in) if one
-                    # exists, so we update it in place instead of leaving a duplicate empty
-                    # row behind. Otherwise append a fresh row for this song.
-                    song_blank = df["Song"].isna() | (
-                        df["Song"].astype(str).str.strip().isin(["", "nan", "None"])
-                    )
-                    placeholder_mask = (df["User ID"] == user_id) & song_blank
-
-                    if placeholder_mask.any():
-                        idx = df[placeholder_mask].index[0]
-                        df.loc[idx, ["Registration ID", "Song", "Score", "Status",
-                                     "Last Attempt", "Voice ID", "Voice Print"]] = [
-                            st.session_state.registration_id, song_key, score,
-                            "QUALIFIED", timestamp, voice_id, voice_str,
-                        ]
-                    else:
-                        new_data = {
-                            "User ID": user_id,
-                            "Registration ID": st.session_state.registration_id,
-                            "Song": song_key,
-                            "Score": score,
-                            "Status": "QUALIFIED",
-                            "Last Attempt": timestamp,
-                            "Voice ID": voice_id,
-                            "Voice Print": voice_str,
-                        }
-                        df = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
-                    saved = True
+                saved, prev_score, songs_passed = _save_qualification(
+                    user_id=user_id,
+                    reg_id=st.session_state.registration_id,
+                    song_key=song_key,
+                    score=score,
+                    voice_sig=voice_sig,
+                    is_final_test=is_final_test,
+                    final_key=FINAL_TEST_KEY,
+                )
 
                 if saved:
-                    conn.update(data=df)
                     st.success("New best score saved!")
-
-                user_progress = df[df["User ID"] == user_id]
-                qualified = user_progress[user_progress["Status"] == "QUALIFIED"]
-                # The final test is not one of the 18 songs, so exclude it from the tally.
-                songs_passed = len(qualified[qualified["Song"] != FINAL_TEST_KEY])
+                else:
+                    st.info(f"Your previous best for this song ({prev_score}%) is kept — "
+                            f"this attempt ({score}%) wasn't higher.")
 
                 if is_final_test:
                     st.snow()

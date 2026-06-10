@@ -100,9 +100,21 @@ A NaN/Inf guard clamps the score to `0.0` if anything goes wrong.
 
 ## 4. Google Sheets integration
 
-Connection uses `streamlit-gsheets` (`st.connection("gsheets", type=GSheetsConnection)`)
-backed by a Google **service account**. The Sheet must be **shared** with the service
-account's email (found in `secrets.toml`) or reads/writes fail.
+Connection uses **`gspread` + `google-auth`** directly (service account). The Sheet must
+be **shared** with the service account's email (found in `secrets.toml`) or reads/writes
+fail. A single authorized worksheet handle is cached with `@st.cache_resource`.
+
+To keep memory/API usage low and avoid lost updates under concurrency, the app does
+**targeted reads/writes** rather than rewriting the whole sheet:
+- **Login** reads the roster via `@st.cache_data(ttl=300)` — loaded once and shared across
+  sessions (so a participant added mid-event may take up to ~5 min to be able to log in).
+- **Saving a qualification** appends a single row (`append_row`) for a new song, or updates
+  a single existing row's `A:H` range (`ws.update`) — never a full-sheet rewrite. This also
+  prevents two simultaneous qualifiers from clobbering each other's rows.
+- **Admin panel** does a fresh full read (`get_all_records`) since it's low-frequency.
+
+> Column order matters: row writes target `A:H` positionally, so the 8 columns must stay in
+> the order listed below.
 
 ### Sheet columns (header row, exactly these names)
 ```
@@ -166,6 +178,36 @@ not proof.
 
 ---
 
+## 6b. Final Test (all 18 songs in sequence) — optional, off by default
+
+- A combined reference track (`final/all_songs.wav`, ~6 minutes) of all 18 songs in order
+  is built by `final/concat_list.txt` (ffmpeg concat, mono/22050).
+- When enabled, it appears as the **last** dropdown option: "🏆 FINAL TEST — Sing All 18
+  Songs in Sequence". The participant must sing the whole sequence, in order, in time.
+- It uses the same scoring pipeline, but with a **coarser analysis hop** (`hop_length=2048`
+  above ~90s of audio) so the long DTW matrix stays within the ~1 GB Streamlit memory.
+- Its result is stored under `Song = FINAL_TEST_ALL_SONGS` and is **excluded** from the
+  "X out of 18" progress count.
+
+**Enable / disable on demand (no code change):** it's controlled by a secret flag and is
+OFF unless explicitly enabled. Add this to the app secrets (Streamlit Cloud → app →
+Settings → Secrets, and/or local `.streamlit/secrets.toml`):
+
+```toml
+[features]
+final_test = true
+```
+
+Set it to `false` (or remove the `[features]` block) to hide the option again. The change
+takes effect on the next rerun — no redeploy needed. The option also only shows if the
+`final/all_songs.wav` file is present in the repo.
+
+> Note: the 85% threshold and scoring anchors were tuned on ~20s songs. The 6-minute test
+> may land at a different raw distance, so you may want to try it and recalibrate the
+> threshold/anchors specifically for the final test.
+
+---
+
 ## 7. Preparing the songs
 
 1. **Download source audio** (`download.py`): uses `yt-dlp` + `ffmpeg` to pull the audio
@@ -183,7 +225,7 @@ automatically (sorted by filename; the display name is the filename without `.wa
 
 - Push the repo to GitHub. Streamlit Cloud builds from `requirements.txt` (Python deps:
   `streamlit`, `librosa`, `numpy`, `soundfile`, `audioread`, `audio-recorder-streamlit`,
-  `st-gsheets-connection`, etc.) and `packages.txt` (system deps: `ffmpeg`).
+  `gspread`, `google-auth`, etc.) and `packages.txt` (system deps: `ffmpeg`).
 - **Secrets are NOT committed.** In the Streamlit Cloud app settings, paste the contents of
   your local `.streamlit/secrets.toml`, including:
   - `[connections.gsheets]` with the **real spreadsheet URL**, worksheet name, and the full
