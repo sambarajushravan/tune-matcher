@@ -7,6 +7,7 @@ from google.oauth2.service_account import Credentials
 import io
 import os
 import re
+import hashlib
 import datetime
 import pandas as pd
 
@@ -247,6 +248,8 @@ if not st.session_state.authenticated:
                 st.session_state.authenticated = True
                 st.session_state.user_id = result[0]
                 st.session_state.registration_id = result[1]
+                st.session_state.attempt_counts = {}  # fresh attempt tally per login
+                st.session_state._last_audio_sig = None
                 st.rerun()
             else:
                 st.error("Name or Registration ID is incorrect. Please check and try again.")
@@ -337,6 +340,8 @@ if logout_col.button("Log out"):
     st.session_state.authenticated = False
     st.session_state.user_id = None
     st.session_state.registration_id = None
+    st.session_state.attempt_counts = {}
+    st.session_state._last_audio_sig = None
     st.rerun()
 
 # --- DYNAMIC SONG LOADING ---
@@ -392,6 +397,16 @@ if user_id and selected_song_path:
     audio_bytes = audio_recorder(text="Click to record", pause_threshold=2.0)
 
     if audio_bytes:
+        # Live, per-session attempt counter (no sheet writes, no API calls). The
+        # audio_recorder can return the same bytes on reruns triggered by other
+        # widgets, so only count a genuinely NEW recording for this song.
+        attempt_counts = st.session_state.setdefault("attempt_counts", {})
+        audio_sig = f"{song_key}:{hashlib.md5(audio_bytes).hexdigest()}"
+        if st.session_state.get("_last_audio_sig") != audio_sig:
+            st.session_state._last_audio_sig = audio_sig
+            attempt_counts[song_key] = attempt_counts.get(song_key, 0) + 1
+        attempt_no = attempt_counts.get(song_key, 1)
+
         with st.spinner("Analyzing your pronunciation, timing, and tune..."):
             # 1. Load Audio files securely
             y_ref, sr_ref = librosa.load(selected_song_path, sr=22050)
@@ -487,6 +502,7 @@ if user_id and selected_song_path:
 
             st.metric("Overall Match Score", f"{score}%")
             st.caption(f"Raw Dist: {round(norm_dist, 2)} | Tempo Acc: {round(time_ratio * 100, 1)}%")
+            st.caption(f"🎙️ Attempt #{attempt_no} for this song (this session).")
 
             # Rough timbre fingerprint of this recording (used only if they qualify)
             voice_sig = _voice_signature(mfcc_user)
