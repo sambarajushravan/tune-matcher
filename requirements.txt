@@ -2,7 +2,6 @@ streamlit
 librosa
 numpy
 soundfile
-audio-recorder-streamlit
 gspread
 google-auth
 audioread

@@ -1,13 +1,11 @@
 import streamlit as st
 import librosa
 import numpy as np
-from audio_recorder_streamlit import audio_recorder
 import gspread
 from google.oauth2.service_account import Credentials
 import io
 import os
 import re
-import hashlib
 import datetime
 import pandas as pd
 
@@ -293,7 +291,6 @@ if not st.session_state.authenticated:
                 st.session_state.user_id = result[0]
                 st.session_state.registration_id = result[1]
                 st.session_state.attempt_counts = {}  # fresh attempt tally per login
-                st.session_state._processed_audio_hash = None
                 st.session_state.pop("completed_songs", None)  # force a fresh progress read
                 st.session_state.pop("final_done", None)
                 st.rerun()
@@ -387,7 +384,6 @@ if logout_col.button("Log out"):
     st.session_state.user_id = None
     st.session_state.registration_id = None
     st.session_state.attempt_counts = {}
-    st.session_state._processed_audio_hash = None
     st.session_state.pop("completed_songs", None)
     st.session_state.pop("final_done", None)
     st.rerun()
@@ -480,24 +476,32 @@ else:
 if user_id and selected_song_path:
     st.audio(selected_song_path)
 
-    st.write("Click the mic and start singing!")
-    # Per-song key: changing songs re-mounts a FRESH recorder so it can't hand back the
-    # previous song's recording (the component retains its clip across reruns otherwise).
-    audio_bytes = audio_recorder(text="Click to record", pause_threshold=2.0,
-                                 key=f"recorder_{song_key}")
+    # Show the target length so the singer knows roughly how long to sing (header read
+    # only — instant, no full decode).
+    try:
+        _target_dur = librosa.get_duration(path=selected_song_path)
+        st.caption(f"⏱️ Target length: about {int(round(_target_dur))} seconds — "
+                   f"sing the whole song before pressing stop.")
+    except Exception:
+        pass
 
-    # Only analyze a genuinely NEW recording. The recorder keeps returning the last
-    # clip on every rerun (e.g., when you switch songs), so without this guard the app
-    # would re-analyze a stale clip against the newly selected song — which can crash
-    # DTW on a length mismatch. Gate on the audio content hash.
-    audio_hash = hashlib.md5(audio_bytes).hexdigest() if audio_bytes else None
-    new_recording = bool(audio_bytes) and audio_hash != st.session_state.get("_processed_audio_hash")
+    st.write("Tap the mic, sing the **whole** song, then press the stop button when "
+             "you're done. Nothing is analyzed until you press **Analyze**.")
+    # st.audio_input lets the SINGER start/stop manually, so it never uploads a partial
+    # clip mid-song (the old recorder auto-stopped on a short pause). Per-song key resets
+    # it when the song changes; native widget => no third-party state quirks, scales fine.
+    audio_value = st.audio_input("Record your singing", key=f"recorder_{song_key}")
 
-    if audio_bytes and not new_recording:
-        st.info("Tap the mic and sing to record this song.")
+    # Explicit confirm step: nothing is analyzed until they press Analyze, so they can
+    # re-record if they stopped too early ("cancel before analysis").
+    do_analyze = audio_value is not None and st.button(
+        "✅ Analyze my recording", key=f"analyze_{song_key}")
+    if audio_value is not None and not do_analyze:
+        st.caption("Recorded. Press **Analyze** when ready — or just record again if you "
+                   "stopped before the song finished.")
 
-    if new_recording:
-        st.session_state._processed_audio_hash = audio_hash
+    if do_analyze:
+        audio_bytes = audio_value.getvalue()
 
         # Live, per-session attempt counter (no sheet writes, no API calls).
         attempt_counts = st.session_state.setdefault("attempt_counts", {})
