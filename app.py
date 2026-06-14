@@ -76,6 +76,34 @@ def _final_test_enabled():
     return bool(val)
 
 
+@st.cache_data(show_spinner=False, max_entries=32)
+def _reference_features(ref_path):
+    """Load + featurize a reference track ONCE and cache it across all sessions.
+    Returns (duration_ref, hop_len, features_ref).
+
+    The reference's MFCC/chroma/pyin (pyin is the slow part) is the same for everyone,
+    so computing it once per song — instead of on every attempt — roughly halves the
+    per-attempt CPU work. That's the single biggest throughput win when many people
+    sing at the same time."""
+    y_ref, sr_ref = librosa.load(ref_path, sr=22050)
+    duration_ref = librosa.get_duration(y=y_ref, sr=sr_ref)
+    # Short songs use a fine hop; the ~6-min final test uses a coarser hop so the DTW
+    # matrix stays bounded. Hop depends only on the reference, keeping this cacheable.
+    hop_len = 512 if duration_ref <= 90 else 2048
+
+    mfcc_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13, hop_length=hop_len)
+    chroma_ref = librosa.feature.chroma_stft(y=y_ref, sr=sr_ref, hop_length=hop_len)
+    f0_ref, _, _ = librosa.pyin(y_ref, fmin=librosa.note_to_hz('C2'),
+                                fmax=librosa.note_to_hz('C7'), sr=sr_ref, hop_length=hop_len)
+    f0_ref = np.nan_to_num(f0_ref)
+    if np.std(f0_ref) > 0:
+        f0_ref = (f0_ref - np.mean(f0_ref)) / (np.std(f0_ref) + 1e-6)
+    f0_ref = f0_ref.reshape(1, -1)
+    mfcc_ref = (mfcc_ref - np.mean(mfcc_ref)) / (np.std(mfcc_ref) + 1e-6)
+    features_ref = np.vstack([mfcc_ref, chroma_ref, f0_ref])
+    return duration_ref, hop_len, features_ref
+
+
 # --- NORMALIZATION HELPERS (for forgiving login matching) ---
 def _norm_name(value):
     """Lowercase + collapse any run of whitespace to a single space + strip.
@@ -477,8 +505,8 @@ if user_id and selected_song_path:
         attempt_no = attempt_counts[song_key]
 
         with st.spinner("Analyzing your pronunciation, timing, and tune..."):
-            # 1. Load Audio files securely
-            y_ref, sr_ref = librosa.load(selected_song_path, sr=22050)
+            # Reference features come from the shared cache (computed once per song).
+            duration_ref, hop_len, features_ref = _reference_features(selected_song_path)
 
             try:
                 y_user, sr_user = librosa.load(io.BytesIO(audio_bytes), sr=22050)
@@ -486,46 +514,24 @@ if user_id and selected_song_path:
                 st.error("Audio decoding error. Please try recording again.")
                 st.stop()
 
-            # --- 2. TIME CHECK (STRICT TEMPO) ---
-            duration_ref = librosa.get_duration(y=y_ref, sr=sr_ref)
+            # --- TIME CHECK (STRICT TEMPO) ---
             duration_user = librosa.get_duration(y=y_user, sr=sr_user)
             time_ratio = min(duration_ref, duration_user) / max(duration_ref, duration_user)
 
-            # --- 3. PRONUNCIATION, TUNE, & MELODY MATCHING ---
-            # A short song (~20s) uses a fine hop. The final test is ~6 minutes, and at
-            # hop=512 the DTW cost matrix (frames x frames) would be ~2 GB and crash the
-            # app. Use a coarser hop above ~90s to keep the matrix bounded.
-            hop_len = 512 if max(duration_ref, duration_user) <= 90 else 2048
-
-            # Layer A: Pronunciation (MFCC)
-            mfcc_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13, hop_length=hop_len)
+            # --- USER FEATURES (same hop as the cached reference) ---
+            # Layer A: Pronunciation (MFCC) — raw mfcc_user also feeds the voice print.
             mfcc_user = librosa.feature.mfcc(y=y_user, sr=sr_user, n_mfcc=13, hop_length=hop_len)
-
             # Layer B: Musical Notes (Chroma)
-            chroma_ref = librosa.feature.chroma_stft(y=y_ref, sr=sr_ref, hop_length=hop_len)
             chroma_user = librosa.feature.chroma_stft(y=y_user, sr=sr_user, hop_length=hop_len)
-
-            # Layer C: Pitch Tracking (f0) to stop completely different songs from matching
-            f0_ref, _, _ = librosa.pyin(y_ref, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr_ref, hop_length=hop_len)
-            f0_user, _, _ = librosa.pyin(y_user, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr_user, hop_length=hop_len)
-
-            # Clean up pitch tracking NaNs (silence/unvoiced frames) safely
-            f0_ref = np.nan_to_num(f0_ref)
+            # Layer C: Pitch Tracking (f0)
+            f0_user, _, _ = librosa.pyin(y_user, fmin=librosa.note_to_hz('C2'),
+                                         fmax=librosa.note_to_hz('C7'), sr=sr_user, hop_length=hop_len)
             f0_user = np.nan_to_num(f0_user)
 
-            # Normalize Pitch so Male vs Female doesn't fail (Tracks relative melody path)
-            f0_ref_norm = (f0_ref - np.mean(f0_ref)) / (np.std(f0_ref) + 1e-6) if np.std(f0_ref) > 0 else f0_ref
             f0_user_norm = (f0_user - np.mean(f0_user)) / (np.std(f0_user) + 1e-6) if np.std(f0_user) > 0 else f0_user
-
-            f0_ref_norm = f0_ref_norm.reshape(1, -1)
             f0_user_norm = f0_user_norm.reshape(1, -1)
-
-            # Normalize MFCCs
-            mfcc_ref_norm = (mfcc_ref - np.mean(mfcc_ref)) / (np.std(mfcc_ref) + 1e-6)
             mfcc_user_norm = (mfcc_user - np.mean(mfcc_user)) / (np.std(mfcc_user) + 1e-6)
 
-            # Combine all 3 dimensions into a dense feature grid
-            features_ref = np.vstack([mfcc_ref_norm, chroma_ref, f0_ref_norm])
             features_user = np.vstack([mfcc_user_norm, chroma_user, f0_user_norm])
 
             # --- 4. DYNAMIC TIME WARPING WITH TIMELINE CONSTRAINTS ---
@@ -597,43 +603,51 @@ if user_id and selected_song_path:
             st.balloons()
             st.success(f"🎉 PASS! You qualified for {display_name} with {score}%!")
 
-            # Saving to the leaderboard must never crash the app: if the Sheet is
-            # unreachable/misconfigured, the user still sees their passing score.
-            try:
-                saved, prev_score, songs_passed = _save_qualification(
-                    user_id=user_id,
-                    reg_id=st.session_state.registration_id,
-                    song_key=song_key,
-                    score=score,
-                    voice_sig=voice_sig,
-                    is_final_test=is_final_test,
-                    final_key=FINAL_TEST_KEY,
-                )
+            # If they've already passed this (per the progress loaded at login), do NOT
+            # touch the sheet at all — no read, no write. Scores aren't improved once
+            # passed, so repeat passes cost zero API calls. This is the main thing that
+            # keeps us well under the rate limits during busy periods.
+            if is_final_test:
+                already_passed = bool(st.session_state.get("final_done"))
+            else:
+                already_passed = song_key in st.session_state.get("completed_songs", set())
 
-                # Keep in-session progress fresh so the ✅ marks update without a re-read.
-                if is_final_test:
-                    st.session_state.final_done = True
-                else:
-                    st.session_state.completed_songs = set(
-                        st.session_state.get("completed_songs", set())) | {song_key}
+            if already_passed:
+                st.info("You've already qualified for this earlier — keeping your existing "
+                        "result. (Scores aren't updated once you've passed.)")
+            else:
+                # Saving must never crash the app: if the Sheet is unreachable, the user
+                # still sees their passing score.
+                try:
+                    saved, prev_score, songs_passed = _save_qualification(
+                        user_id=user_id,
+                        reg_id=st.session_state.registration_id,
+                        song_key=song_key,
+                        score=score,
+                        voice_sig=voice_sig,
+                        is_final_test=is_final_test,
+                        final_key=FINAL_TEST_KEY,
+                    )
 
-                if saved:
-                    st.success("New best score saved!")
-                else:
-                    st.info(f"Your previous best for this song ({prev_score}%) is kept — "
-                            f"this attempt ({score}%) wasn't higher.")
+                    # Keep in-session progress fresh so ✅ marks update without a re-read.
+                    if is_final_test:
+                        st.session_state.final_done = True
+                    else:
+                        st.session_state.completed_songs = set(
+                            st.session_state.get("completed_songs", set())) | {song_key}
 
-                if is_final_test:
-                    st.snow()
-                    st.success("🏆 CONGRATULATIONS! You passed the FINAL TEST — "
-                               "all 18 songs sung in sequence!")
-                else:
-                    st.info(f"Progress: You have qualified for {songs_passed} out of 18 songs!")
-                    if songs_passed == 18:
+                    if is_final_test:
                         st.snow()
-                        st.success("🏆 AMAZING! You have qualified for ALL 18 songs!")
-            except Exception as e:
-                st.warning("Your score counts, but we couldn't reach the leaderboard right now. "
-                           "(Check that the Google Sheet is shared with the service account email.)")
+                        st.success("🏆 CONGRATULATIONS! You passed the FINAL TEST — "
+                                   "all 18 songs sung in sequence!")
+                    else:
+                        st.success("Result saved!")
+                        st.info(f"Progress: You have qualified for {songs_passed} out of 18 songs!")
+                        if songs_passed == 18:
+                            st.snow()
+                            st.success("🏆 AMAZING! You have qualified for ALL 18 songs!")
+                except Exception as e:
+                    st.warning("Your score counts, but we couldn't reach the leaderboard right now. "
+                               "(Check that the Google Sheet is shared with the service account email.)")
         else:
             st.error(f"Score: {score}%. You need 85% to qualify for {display_name}. Try again!")
