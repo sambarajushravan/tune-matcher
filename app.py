@@ -394,7 +394,10 @@ if user_id and selected_song_path:
     st.audio(selected_song_path)
 
     st.write("Click the mic and start singing!")
-    audio_bytes = audio_recorder(text="Click to record", pause_threshold=2.0)
+    # Per-song key: changing songs re-mounts a FRESH recorder so it can't hand back the
+    # previous song's recording (the component retains its clip across reruns otherwise).
+    audio_bytes = audio_recorder(text="Click to record", pause_threshold=2.0,
+                                 key=f"recorder_{song_key}")
 
     # Only analyze a genuinely NEW recording. The recorder keeps returning the last
     # clip on every rerun (e.g., when you switch songs), so without this guard the app
