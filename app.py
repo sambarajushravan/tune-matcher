@@ -48,6 +48,22 @@ def _read_records():
     return _get_worksheet().get_all_records()
 
 
+def _get_user_progress(user_id):
+    """One read of the sheet -> (set of individual songs this user has QUALIFIED,
+    bool whether they passed the Final Test). Called once per login; kept fresh
+    in-session afterwards so we don't re-read on every rerun."""
+    completed, final_done = set(), False
+    for r in _read_records():
+        if (str(r.get("User ID", "")).strip() == user_id
+                and str(r.get("Status", "")).strip() == "QUALIFIED"):
+            s = str(r.get("Song", "")).strip()
+            if s == FINAL_TEST_KEY:
+                final_done = True
+            elif s:
+                completed.add(s)
+    return completed, final_done
+
+
 def _final_test_enabled():
     """Final Test (all-songs combined) is OFF unless [features] final_test is truthy
     in secrets. Lets you turn it on/off on demand without a code change."""
@@ -250,6 +266,8 @@ if not st.session_state.authenticated:
                 st.session_state.registration_id = result[1]
                 st.session_state.attempt_counts = {}  # fresh attempt tally per login
                 st.session_state._processed_audio_hash = None
+                st.session_state.pop("completed_songs", None)  # force a fresh progress read
+                st.session_state.pop("final_done", None)
                 st.rerun()
             else:
                 st.error("Name or Registration ID is incorrect. Please check and try again.")
@@ -342,6 +360,8 @@ if logout_col.button("Log out"):
     st.session_state.registration_id = None
     st.session_state.attempt_counts = {}
     st.session_state._processed_audio_hash = None
+    st.session_state.pop("completed_songs", None)
+    st.session_state.pop("final_done", None)
     st.rerun()
 
 # --- DYNAMIC SONG LOADING ---
@@ -359,20 +379,57 @@ else:
     available_songs = {}
     st.error("Songs directory not found! Please check your GitHub folder structure.")
 
-# 2. Song Selection (the final test, if present, is always offered last)
+# Load this user's already-qualified songs once per session (one sheet read). It is
+# then kept fresh in-session as they pass more songs, so we never re-read on reruns.
+if "completed_songs" not in st.session_state:
+    try:
+        completed, final_done = _get_user_progress(user_id)
+    except Exception:
+        completed, final_done = set(), False
+    st.session_state.completed_songs = completed
+    st.session_state.final_done = final_done
+
+completed_songs = st.session_state.completed_songs
+
+# Progress summary + lists of what's done and what's left.
+total_songs = len(available_songs)
+done_here = [n for n in available_songs if n in completed_songs]
+remaining = [n for n in available_songs if n not in completed_songs]
+st.progress(len(done_here) / total_songs if total_songs else 0.0,
+            text=f"Completed {len(done_here)} of {total_songs} songs")
+if done_here:
+    with st.expander(f"✅ Completed songs ({len(done_here)})"):
+        st.write("\n".join(f"- {n}" for n in done_here))
+if remaining:
+    with st.expander(f"🎯 Remaining songs ({len(remaining)})"):
+        st.write("\n".join(f"- {n}" for n in remaining))
+
+# 2. Song Selection (the final test, if present, is always offered last). Completed
+# songs are marked with ✅ but stay selectable in case they want to improve a score.
 selected_song_path = None
 is_final_test = False
 song_key = None       # value stored in the sheet's "Song" column
 display_name = None   # friendly name used in user-facing messages
 
-options = list(available_songs.keys())
+label_to_name = {}
+options = []
+for name in available_songs:
+    label = f"✅ {name}" if name in completed_songs else name
+    label_to_name[label] = name
+    options.append(label)
 # Final Test is only offered when its combined track exists AND it is enabled in
 # secrets ([features] final_test = true). Off by default; enable on demand.
 if os.path.exists(FINAL_TEST_PATH) and _final_test_enabled():
-    options.append(FINAL_TEST_LABEL)
+    final_label = ("✅ " + FINAL_TEST_LABEL) if st.session_state.get("final_done") else FINAL_TEST_LABEL
+    label_to_name[final_label] = FINAL_TEST_LABEL
+    options.append(final_label)
 
 if options:
-    selected_song_name = st.selectbox("Choose a song to practice:", options)
+    # Default to the first not-yet-completed song so they land on something to do.
+    default_index = next((i for i, lbl in enumerate(options)
+                          if not lbl.startswith("✅")), 0)
+    selected_label = st.selectbox("Choose a song to practice:", options, index=default_index)
+    selected_song_name = label_to_name[selected_label]
     if selected_song_name == FINAL_TEST_LABEL:
         is_final_test = True
         selected_song_path = FINAL_TEST_PATH
@@ -387,6 +444,8 @@ if options:
         selected_song_path = available_songs[selected_song_name]
         song_key = selected_song_name
         display_name = selected_song_name
+    if song_key in completed_songs:
+        st.info(f"You've already qualified for this song. Re-sing only if you want a higher score.")
 else:
     st.warning("No songs found in the /songs folder.")
 
@@ -550,6 +609,13 @@ if user_id and selected_song_path:
                     is_final_test=is_final_test,
                     final_key=FINAL_TEST_KEY,
                 )
+
+                # Keep in-session progress fresh so the ✅ marks update without a re-read.
+                if is_final_test:
+                    st.session_state.final_done = True
+                else:
+                    st.session_state.completed_songs = set(
+                        st.session_state.get("completed_songs", set())) | {song_key}
 
                 if saved:
                     st.success("New best score saved!")
