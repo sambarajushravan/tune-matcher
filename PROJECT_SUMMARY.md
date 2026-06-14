@@ -12,14 +12,22 @@ cheating.
 
 1. **Login gate** – A participant must enter their **Name** and **Registration ID**
    (their "password"). Both are validated against a roster stored in Google Sheets.
-2. **Pick a song** – Songs are loaded dynamically from the `songs/` folder (one
-   `.wav` per song). There are 18 songs.
-3. **Record & score** – The participant records themselves singing. The app compares
-   their recording to the reference and produces an **Overall Match Score (%)**.
-4. **Pass threshold = 85%** – At 85% or higher the attempt is marked `QUALIFIED` and
-   saved to the leaderboard sheet (only if it beats their previous best for that song).
-5. **Progress tracking** – Shows "X out of 18 songs" qualified; celebrates at 18/18.
-6. **Admin panel** – A password-protected expander shows qualification stats,
+2. **Progress on login** – After login it reads their qualified songs once and shows a
+   progress bar plus "Completed" / "Remaining" lists. Completed songs are marked with ✅
+   in the dropdown, and the selection defaults to the first unfinished song.
+3. **Pick a song** – Songs are loaded dynamically from the `songs/` folder (one `.wav`
+   per song). There are 18 songs. An optional combined "Final Test" can be enabled (§6b).
+4. **Record & analyze** – Uses Streamlit's native `st.audio_input`: the singer presses
+   start/stop **manually** (so it never cuts off on a pause), then presses **Analyze**.
+   Nothing is processed until Analyze is pressed, so they can re-record if they stopped
+   early. A live, per-session **attempt counter** ("Attempt #N") is shown.
+5. **Score** – The app compares the recording to the reference and produces an **Overall
+   Match Score (%)**.
+6. **Pass threshold = 85%** – At 85%+ the attempt is `QUALIFIED` and saved. **Once a
+   participant has passed a song, scores are not updated** (re-singing a passed song does
+   no sheet read/write at all — keeps API usage minimal).
+7. **Progress tracking** – Shows "X out of 18 songs" qualified; celebrates at 18/18.
+8. **Admin panel** – A password-protected expander shows qualification stats,
    a leaderboard, per-song completion chart, a voice-audit flag, and a raw activity log.
 
 ---
@@ -35,7 +43,9 @@ tune-matcher/
 ├── packages.txt            # System packages for Streamlit Cloud (ffmpeg)
 ├── .gitignore              # Ignores secrets, venvs, the summary PDF, etc.
 ├── PROJECT_SUMMARY.md      # This document
+├── README.md               # Short project README
 ├── songs/                  # The 18 reference .wav files the app plays/compares
+├── final/                  # Optional Final Test: all_songs.wav + concat_list.txt
 └── .streamlit/
     └── secrets.toml        # Local secrets (NOT committed – gitignored)
 ```
@@ -50,7 +60,14 @@ tune-matcher/
 Audio is loaded at `sr=22050` for both the reference and the user (with a `try/except`
 so iPhone recordings that fail to decode show a friendly error instead of crashing).
 
-**Three feature layers** are extracted with a consistent `hop_length=512`:
+**Reference features are cached** (`_reference_features`, `@st.cache_data`): each song's
+MFCC/chroma/`pyin` is computed **once** and shared across all sessions, so only the user's
+audio is processed per attempt. The analysis hop is chosen from the **reference** length
+(`512` for short songs, `2048` above ~90s like the Final Test) which keeps it cacheable.
+The DTW call is wrapped with a fallback to unconstrained DTW so a recording whose length
+differs a lot from the reference can never crash it.
+
+**Three feature layers** are extracted with a consistent per-song `hop_length`:
 
 | Layer | Feature | Purpose |
 |-------|---------|---------|
@@ -108,9 +125,13 @@ To keep memory/API usage low and avoid lost updates under concurrency, the app d
 **targeted reads/writes** rather than rewriting the whole sheet:
 - **Login** reads the roster via `@st.cache_data(ttl=300)` — loaded once and shared across
   sessions (so a participant added mid-event may take up to ~5 min to be able to log in).
-- **Saving a qualification** appends a single row (`append_row`) for a new song, or updates
-  a single existing row's `A:H` range (`ws.update`) — never a full-sheet rewrite. This also
-  prevents two simultaneous qualifiers from clobbering each other's rows.
+- **Progress read** runs once per login (`_get_user_progress`) to populate the completed/
+  remaining lists; it's then kept fresh in-session as the user passes more songs.
+- **Saving a qualification** appends a single row (`append_row`) for a new song, or fills a
+  blank placeholder/updates a single existing row's `A:H` range (`ws.update`) — never a
+  full-sheet rewrite. This also prevents two simultaneous qualifiers from clobbering rows.
+- **Already-passed songs do no sheet I/O** — if the participant already qualified for a song
+  (per the progress loaded at login), re-singing it skips the read and the write entirely.
 - **Admin panel** does a fresh full read (`get_all_records`) since it's low-frequency.
 
 > Column order matters: row writes target `A:H` positionally, so the 8 columns must stay in
@@ -136,9 +157,10 @@ User ID | Registration ID | Song | Score | Status | Last Attempt | Voice ID | Vo
 
 ### Upsert rules
 - One row per `(User ID, Song)`.
-- If a row already exists and is `QUALIFIED`, it's only overwritten when the **new score
-  is higher** than the stored best. Otherwise the previous best is kept.
-- New `(User ID, Song)` combos are appended as new rows.
+- **A song is saved only once** — the first qualifying pass. After that, scores are not
+  updated (re-singing a passed song does nothing on the sheet).
+- The first pass fills the participant's blank roster placeholder row if present, otherwise
+  appends a new row.
 
 ---
 
@@ -175,6 +197,13 @@ User ID | Registration ID | Song | Score | Status | Last Attempt | Voice ID | Vo
 Caveats: the print is content-dependent (it reacts to which song/words were sung, not
 just the voice), so similarity thresholds are approximate. Treat flags as "look into this",
 not proof.
+
+> **About the unreadable Voice Print column:** it is intentionally not human-readable — it
+> is the feature vector the matching needs. Voice ID is *derived from* it, so you cannot
+> drop Voice Print and keep Voice ID working. (An MD5/hash would only catch byte-identical
+> re-uploads, not the same person singing a different take.) If the gibberish bothers you,
+> just **hide that column in the Google Sheet UI** (right-click the column → Hide); the
+> admin report already omits it.
 
 ---
 
@@ -224,8 +253,9 @@ automatically (sorted by filename; the display name is the filename without `.wa
 ## 8. Deployment (Streamlit Community Cloud)
 
 - Push the repo to GitHub. Streamlit Cloud builds from `requirements.txt` (Python deps:
-  `streamlit`, `librosa`, `numpy`, `soundfile`, `audioread`, `audio-recorder-streamlit`,
-  `gspread`, `google-auth`, etc.) and `packages.txt` (system deps: `ffmpeg`).
+  `streamlit`, `librosa`, `numpy`, `soundfile`, `audioread`, `gspread`, `google-auth`) and
+  `packages.txt` (system deps: `ffmpeg`). Recording uses the **native `st.audio_input`**
+  (needs a recent Streamlit; `streamlit` is unpinned so Cloud installs a current version).
 - **Secrets are NOT committed.** In the Streamlit Cloud app settings, paste the contents of
   your local `.streamlit/secrets.toml`, including:
   - `[connections.gsheets]` with the **real spreadsheet URL**, worksheet name, and the full
@@ -242,6 +272,28 @@ pip install -r requirements.txt
 # create .streamlit/secrets.toml with real values
 streamlit run app.py
 ```
+
+---
+
+## 8b. Scalability notes (free tier)
+
+Designed for ~2000 participants completing songs **over time**, with light concurrency.
+
+- **Cost:** Streamlit Community Cloud and the Google Sheets API are both free; neither can
+  auto-charge (no billing attached). Exceeding limits yields throttling / `429` "busy"
+  errors, never a bill.
+- **Main bottleneck = the single free container** (~1 GB RAM, limited CPU, no autoscaling).
+  Audio analysis (`pyin` + DTW) is CPU-heavy and largely serialized by the GIL, so a large
+  *simultaneous* burst (many dozens at the same moment) can slow down or hit memory limits.
+  Spread-out usage is fine.
+- **Optimizations already in place to raise the ceiling:**
+  - Reference features cached once per song (≈ halves per-attempt CPU).
+  - Roster read cached 5 min and shared across sessions.
+  - No sheet I/O for already-passed songs; first pass = one write.
+  - Only a confirmed (Analyze-pressed) recording is ever processed.
+- **If a large simultaneous crowd is expected**, the real fix is capacity, not code: a host
+  that scales beyond one container (e.g., Streamlit in Snowflake or self-hosting behind
+  autoscaling), and/or staggering participation (which the "songs over days" model allows).
 
 ---
 
