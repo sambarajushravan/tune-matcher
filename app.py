@@ -249,7 +249,7 @@ if not st.session_state.authenticated:
                 st.session_state.user_id = result[0]
                 st.session_state.registration_id = result[1]
                 st.session_state.attempt_counts = {}  # fresh attempt tally per login
-                st.session_state._last_audio_sig = None
+                st.session_state._processed_audio_hash = None
                 st.rerun()
             else:
                 st.error("Name or Registration ID is incorrect. Please check and try again.")
@@ -341,7 +341,7 @@ if logout_col.button("Log out"):
     st.session_state.user_id = None
     st.session_state.registration_id = None
     st.session_state.attempt_counts = {}
-    st.session_state._last_audio_sig = None
+    st.session_state._processed_audio_hash = None
     st.rerun()
 
 # --- DYNAMIC SONG LOADING ---
@@ -396,16 +396,23 @@ if user_id and selected_song_path:
     st.write("Click the mic and start singing!")
     audio_bytes = audio_recorder(text="Click to record", pause_threshold=2.0)
 
-    if audio_bytes:
-        # Live, per-session attempt counter (no sheet writes, no API calls). The
-        # audio_recorder can return the same bytes on reruns triggered by other
-        # widgets, so only count a genuinely NEW recording for this song.
+    # Only analyze a genuinely NEW recording. The recorder keeps returning the last
+    # clip on every rerun (e.g., when you switch songs), so without this guard the app
+    # would re-analyze a stale clip against the newly selected song — which can crash
+    # DTW on a length mismatch. Gate on the audio content hash.
+    audio_hash = hashlib.md5(audio_bytes).hexdigest() if audio_bytes else None
+    new_recording = bool(audio_bytes) and audio_hash != st.session_state.get("_processed_audio_hash")
+
+    if audio_bytes and not new_recording:
+        st.info("Tap the mic and sing to record this song.")
+
+    if new_recording:
+        st.session_state._processed_audio_hash = audio_hash
+
+        # Live, per-session attempt counter (no sheet writes, no API calls).
         attempt_counts = st.session_state.setdefault("attempt_counts", {})
-        audio_sig = f"{song_key}:{hashlib.md5(audio_bytes).hexdigest()}"
-        if st.session_state.get("_last_audio_sig") != audio_sig:
-            st.session_state._last_audio_sig = audio_sig
-            attempt_counts[song_key] = attempt_counts.get(song_key, 0) + 1
-        attempt_no = attempt_counts.get(song_key, 1)
+        attempt_counts[song_key] = attempt_counts.get(song_key, 0) + 1
+        attempt_no = attempt_counts[song_key]
 
         with st.spinner("Analyzing your pronunciation, timing, and tune..."):
             # 1. Load Audio files securely
@@ -464,14 +471,30 @@ if user_id and selected_song_path:
             # 0.1 == warp window of ~10% of the song length, which cuts off "cheat pathways"
             # that let a wrong song meander to a low cost. (band_rad=10 was a no-op: it made the
             # band 10x wider than the matrix, i.e. no constraint at all.)
-            D, wp = librosa.sequence.dtw(
-                X=features_ref,
-                Y=features_user,
-                metric='euclidean',
-                backtrack=True,
-                global_constraints=True,
-                band_rad=0.1
-            )
+            try:
+                D, wp = librosa.sequence.dtw(
+                    X=features_ref,
+                    Y=features_user,
+                    metric='euclidean',
+                    backtrack=True,
+                    global_constraints=True,
+                    band_rad=0.1
+                )
+            except Exception:
+                # The Sakoe-Chiba band can fail when the recording length differs a lot
+                # from the reference (e.g., a very short/partial clip). Fall back to
+                # unconstrained DTW so we still produce a score instead of crashing.
+                try:
+                    D, wp = librosa.sequence.dtw(
+                        X=features_ref,
+                        Y=features_user,
+                        metric='euclidean',
+                        backtrack=True
+                    )
+                except Exception:
+                    st.error("Couldn't analyze this recording — it may be too short or "
+                             "silent. Please record again.")
+                    st.stop()
 
             final_accumulated_cost = D[-1, -1]
             path_length = len(wp)
