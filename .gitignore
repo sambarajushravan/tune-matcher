@@ -9,8 +9,13 @@ __pycache__/
 # Virtual environments
 .venv/
 .venv_test/
+.venv_trim/
 venv/
 env/
+
+# Song-trimming intermediates (originals backup + preview output)
+songs_backup/
+songs_trimmed/
 
 # Local connectivity test helper
 test_gsheets.py
