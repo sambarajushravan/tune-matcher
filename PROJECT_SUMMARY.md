@@ -1,10 +1,10 @@
 # Sataka Sankharavam Tune Matcher Challenge
 
 A Streamlit web app where registered participants sing along to reference songs,
-get an automatic match score (pronunciation + tune + timing), and have their
-qualified songs tracked on a Google Sheets leaderboard. Includes a password-gated
-admin panel with stats and a lightweight voice-audit flag for spotting possible
-cheating.
+get an automatic match score (pronunciation + pacing), and have their qualified songs
+tracked on a Google Sheets leaderboard. After each attempt the app shows coaching feedback
+(notes/melody bars are guidance only). Includes a password-gated admin panel with stats
+and a lightweight family-scoped voice-audit flag for spotting possible cheating.
 
 ---
 
@@ -22,12 +22,16 @@ cheating.
    Nothing is processed until Analyze is pressed, so they can re-record if they stopped
    early. A live, per-session **attempt counter** ("Attempt #N") is shown.
 5. **Score** – The app compares the recording to the reference and produces an **Overall
-   Match Score (%)**.
-6. **Pass threshold = 85%** – At 85%+ the attempt is `QUALIFIED` and saved. **Once a
+   Match Score (%)**, driven by **pronunciation (MFCC)** and **pacing**. Musical notes and
+   melody are shown as coaching bars only — they do not affect pass/fail.
+6. **Coaching feedback** – After analysis, shows pronunciation / notes / melody progress
+   bars, a plain-language pacing message (too fast / too slow / good), and tips to improve.
+   Raw Dist and Tempo Acc are hidden in a "Technical details (for organizers)" expander.
+7. **Pass threshold = 85%** – At 85%+ the attempt is `QUALIFIED` and saved. **Once a
    participant has passed a song, scores are not updated** (re-singing a passed song does
    no sheet read/write at all — keeps API usage minimal).
-7. **Progress tracking** – Shows "X out of 18 songs" qualified; celebrates at 18/18.
-8. **Admin panel** – A password-protected expander shows qualification stats,
+8. **Progress tracking** – Shows "X out of 18 songs" qualified; celebrates at 18/18.
+9. **Admin panel** – A password-protected expander shows qualification stats,
    a leaderboard, per-song completion chart, a voice-audit flag, and a raw activity log.
 
 ---
@@ -39,77 +43,110 @@ tune-matcher/
 ├── app.py                  # The Streamlit app (main file)
 ├── download.py             # yt-dlp helper used to fetch the source YouTube audio
 ├── split_songs.py          # Splits the long source audio into 18 verse .wav files
+├── trim_songs.py           # Trims instrumental intro/outro from reference .wav files
 ├── requirements.txt        # Python dependencies (Streamlit Cloud installs these)
 ├── packages.txt            # System packages for Streamlit Cloud (ffmpeg)
 ├── .gitignore              # Ignores secrets, venvs, the summary PDF, etc.
 ├── PROJECT_SUMMARY.md      # This document
 ├── README.md               # Short project README
-├── songs/                  # The 18 reference .wav files the app plays/compares
+├── songs/                  # The 18 trimmed reference .wav files the app plays/compares
+├── songs_backup/           # Auto-backup of originals before in-place trim (gitignored)
 ├── final/                  # Optional Final Test: all_songs.wav + concat_list.txt
 └── .streamlit/
     └── secrets.toml        # Local secrets (NOT committed – gitignored)
 ```
 
-> `secrets.toml`, the virtual environments (`.venv/`, `.venv_test/`), `test_gsheets.py`,
-> and `tune_matcher_summary.pdf` are intentionally git-ignored.
+> `secrets.toml`, the virtual environments (`.venv/`, `.venv_test/`, `.venv_trim/`),
+> `songs_backup/`, `songs_trimmed/`, `test_gsheets.py`, generated PDFs (`*.pdf`), and
+> `tune_matcher_summary.pdf` are intentionally git-ignored.
 
 ---
 
-## 3. How the score is calculated (`app.py`, sections 1–5)
+## 3. How the score is calculated (`app.py`)
 
 Audio is loaded at `sr=22050` for both the reference and the user (with a `try/except`
 so iPhone recordings that fail to decode show a friendly error instead of crashing).
 
 **Reference features are cached** (`_reference_features`, `@st.cache_data`): each song's
-MFCC/chroma/`pyin` is computed **once** and shared across all sessions, so only the user's
-audio is processed per attempt. The analysis hop is chosen from the **reference** length
-(`512` for short songs, `2048` above ~90s like the Final Test) which keeps it cacheable.
-The DTW call is wrapped with a fallback to unconstrained DTW so a recording whose length
-differs a lot from the reference can never crash it.
+MFCC/chroma/pitch is computed **once** and shared across all sessions. The cache key
+includes the file's **modification time** so trimmed/replaced `.wav` files invalidate stale
+entries (without this, pacing could still reference an old ~30s duration after trimming
+song 18 to 18s).
 
-**Three feature layers** are extracted with a consistent per-song `hop_length`:
+The analysis hop is chosen from the **reference** length (`512` for short songs, `2048`
+above ~90s like the Final Test). The DTW call has a fallback to unconstrained DTW so a
+recording whose length differs a lot from the reference can never crash it.
 
-| Layer | Feature | Purpose |
-|-------|---------|---------|
-| A | MFCC (z-scored) | Pronunciation / words / vocal-tract timbre |
-| B | Chroma | Musical notes, robust to male/female octave shifts |
-| C | Pitch `f0` via `pyin` (z-scored) | Melody line / shape; stops a totally different song from matching |
+### What drives pass/fail
 
-The three layers are stacked into one feature matrix for the reference and the user.
+| Component | Affects Overall Score? | How |
+|-----------|------------------------|-----|
+| **Pronunciation (MFCC)** | **Yes — main driver** | MFCC-only DTW with Sakoe–Chiba band |
+| **Pacing / timing** | **Yes — up to 40% blend** | Recording length vs. reference length |
+| **Musical notes (Chroma)** | No — coaching only | Shown as guidance bar after analysis |
+| **Melody line (Pitch f0)** | No — coaching only | Shown as guidance bar after analysis |
 
-**Dynamic Time Warping (DTW)** aligns the two sequences:
-- `metric='euclidean'` (literal value match, stricter than cosine).
-- `global_constraints=True, band_rad=0.1` applies a **Sakoe–Chiba band** so the warp
-  window is ~10% of the song length. This blocks "cheat paths" that let a wrong song
-  meander to a low cost.
-  - Note: `band_rad` is a **fraction** of the longer sequence. `band_rad=10` would be a
-    no-op (band 10× wider than the matrix). Use small fractions like `0.1`.
+Chroma and pitch are still extracted for the **coaching breakdown** ("How you did"), but
+they are **not** stacked into the DTW that produces the Overall Match Score.
 
-**Normalized distance:** `norm_dist = D[-1,-1] / len(path)`.
+### Scoring pipeline
 
-**Anchor-scaling score** (piecewise linear):
+1. **Extract features** with a consistent per-song `hop_length`:
+   - MFCC (z-scored) — pronunciation / words / vocal-tract timbre
+   - Chroma — musical notes (coaching only)
+   - Pitch `f0` via `pyin` (z-scored) — melody line (coaching only)
+
+2. **DTW on MFCC only** aligns reference and user pronunciation:
+   - `metric='euclidean'`
+   - `global_constraints=True, band_rad=0.1` (Sakoe–Chiba band ~10% of song length)
+
+3. **Normalized distance:** `norm_dist = D[-1,-1] / len(path)` (MFCC-only).
+
+4. **Anchor-scaling base score** (piecewise linear):
 ```python
-GOOD_MATCH_DIST = 1.90   # where a correct rendition lands
-PENALTY_SLOPE   = 150.0  # how fast score drops past the anchor
+GOOD_MATCH_DIST = 1.45   # MFCC-only anchor (correct human rendition ~1.3–1.5)
+PENALTY_SLOPE   = 80.0
 
 if norm_dist <= GOOD_MATCH_DIST:
     base_score = 100.0 - ((norm_dist / GOOD_MATCH_DIST) * 5.0)   # ~95–100
 else:
     base_score = max(0.0, 95.0 - ((norm_dist - GOOD_MATCH_DIST) * PENALTY_SLOPE))
-
-final_score = base_score * time_ratio   # tempo multiplier
 ```
 
-**Tempo multiplier (`time_ratio`)** = `min(dur_ref, dur_user) / max(dur_ref, dur_user)`.
-Singing much faster or slower drags the score down.
+5. **Pacing blend** (timing matters):
+```python
+TEMPO_TOLERANCE = 0.90   # no penalty within ~10% of reference length
+TEMPO_WEIGHT    = 0.40   # pacing contributes up to 40% of the final blend
+
+time_ratio = min(dur_ref, dur_user) / max(dur_ref, dur_user)
+if time_ratio >= TEMPO_TOLERANCE:
+    tempo_factor = 1.0
+else:
+    tempo_factor = max(0.0, (time_ratio - 0.5) / (TEMPO_TOLERANCE - 0.5))
+
+tempo_blend = (1.0 - TEMPO_WEIGHT) + (TEMPO_WEIGHT * tempo_factor)
+final_score = base_score * tempo_blend
+```
 
 A NaN/Inf guard clamps the score to `0.0` if anything goes wrong.
 
+### Coaching feedback (separate from pass/fail)
+
+After scoring, the app shows:
+- Progress bars for pronunciation, musical notes, and melody (each mapped from per-layer
+  DTW path distance along the MFCC alignment).
+- A plain-language **pacing** message (too fast / too slow / good), using the **current**
+  reference file duration.
+- **Tips to improve** — prioritizes pronunciation and pacing; notes/melody tips only if
+  very low and marked "(Optional)".
+- **Technical details (for organizers)** expander: Raw Dist (MFCC), Tempo Acc, base score,
+  tempo blend, and reference length in seconds.
+
 ### Tuning guide
-- Correct renditions tend to land near `norm_dist ≈ 1.90` (score ~90s).
-- Wrong songs land higher (`≈ 2.15+`) and fall below 50, down to 0.
+- Correct renditions tend to land near `norm_dist ≈ 1.3–1.5` (MFCC-only) → score ~90–95.
 - To make passing **harder**: lower `GOOD_MATCH_DIST` or raise `PENALTY_SLOPE`.
 - To make passing **easier**: raise `GOOD_MATCH_DIST` or lower `PENALTY_SLOPE`.
+- To weight **pacing** more: raise `TEMPO_WEIGHT` or lower `TEMPO_TOLERANCE`.
 - The pass threshold itself (`85`) appears in three places in `app.py`: the intro
   caption, the `if score >= 85` check, and the failure message. Change all three together.
 
@@ -225,8 +262,9 @@ recordings. Treat every flag as "listen to this", not proof.
 
 ## 6b. Final Test (all 18 songs in sequence) — optional, off by default
 
-- A combined reference track (`final/all_songs.wav`, ~6 minutes) of all 18 songs in order
-  is built by `final/concat_list.txt` (ffmpeg concat, mono/22050).
+- A combined reference track (`final/all_songs.wav`, ~5–6 minutes after trimming) of all
+  18 trimmed songs in order is built by concatenating the files in `songs/` (or via
+  `final/concat_list.txt` for ffmpeg concat, mono/22050).
 - When enabled, it appears as the **last** dropdown option: "🏆 FINAL TEST — Sing All 18
   Songs in Sequence". The participant must sing the whole sequence, in order, in time.
 - It uses the same scoring pipeline, but with a **coarser analysis hop** (`hop_length=2048`
@@ -260,9 +298,25 @@ takes effect on the next rerun — no redeploy needed. The option also only show
 2. **Split into verses** (`split_songs.py`): uses `ffmpeg` with hardcoded `(start_time,
    filename)` cut points (derived from the video captions) to produce the 18 individual
    `.wav` files. A verse ends when the lyric ends with "sumati" or "vinura vema".
+3. **Trim instrumental intro/outro** (`trim_songs.py`): each reference should contain only
+   the **vocal span** — from the first sung word through the closing "Sumathi"/"Vinura Vema".
+   Trailing (and leading) instrumental is removed so the scorer isn't penalized for music
+   the singer shouldn't match. Mid-song music between words is kept.
 
-To add/replace songs later: drop new `.wav` files into `songs/`. The selectbox lists them
-automatically (sorted by filename; the display name is the filename without `.wav`).
+   ```bash
+   python trim_songs.py              # writes trimmed copies to songs_trimmed/ for review
+   python trim_songs.py --inplace    # overwrites songs/ (backs up to songs_backup/ first)
+   ```
+
+   Auto-detection uses vocal separation + an energy gate. If a song trims incorrectly,
+   add manual `(start_sec, end_sec)` overrides in the `MANUAL` dict inside `trim_songs.py`
+   (e.g. song 18 capped at 18.0s). After trimming, rebuild the Final Test track:
+   `final/all_songs.wav` is concatenated from the trimmed `songs/` files.
+
+To add/replace songs later: drop new `.wav` files into `songs/` (trim first if needed).
+The selectbox lists them automatically (sorted by filename; the display name is the
+filename without `.wav`). Replacing a file invalidates the reference cache automatically
+(via file modification time).
 
 ---
 
