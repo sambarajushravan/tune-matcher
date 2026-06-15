@@ -91,6 +91,47 @@ MIN_ARTICULATION_RATIO = 0.68  # user syllable variation vs reference (hums are 
 
 # MFCC rows used for pass/fail (skip c0–c3: energy/broad spectrum — humming matches these).
 _ARTICULATION_ROWS = slice(4, 13)
+# Selected poem must beat every other poem by at least this identity distance margin.
+_WRONG_SONG_MARGIN = 0.04
+
+
+def _dtw_norm_dist(X, Y):
+    """Band-constrained DTW distance normalized by path length."""
+    try:
+        D, wp = librosa.sequence.dtw(
+            X, Y, metric='euclidean', backtrack=True,
+            global_constraints=True, band_rad=0.1,
+        )
+    except Exception:
+        D, wp = librosa.sequence.dtw(X, Y, metric='euclidean', backtrack=True)
+    pl = len(wp)
+    return float(D[-1, -1] / pl) if pl > 0 else 100.0
+
+
+def _song_identity_matrix(chroma, mfcc):
+    """Chroma + articulation MFCC — discriminates WHICH padyam was sung."""
+    return np.vstack([chroma, _articulation_mfcc(mfcc) * 1.2])
+
+
+def _detect_wrong_song(song_key, chroma_user, mfcc_user_norm, available_songs):
+    """Return (is_wrong, best_match_name).
+
+    Compares the recording against every reference. If another padyam is a clearly
+    better match than the one selected in the dropdown, the singer likely performed
+    the wrong poem (e.g. sang poem 1 while poem 2 was selected)."""
+    ident_user = _song_identity_matrix(chroma_user, mfcc_user_norm)
+    dists = {}
+    for name, path in available_songs.items():
+        mtime = os.path.getmtime(path)
+        _, _, mfcc_r, chroma_r, _ = _reference_features(path, mtime)
+        dists[name] = _dtw_norm_dist(_song_identity_matrix(chroma_r, mfcc_r), ident_user)
+
+    selected_dist = dists[song_key]
+    best_name = min(dists, key=dists.get)
+    best_dist = dists[best_name]
+    if best_name != song_key and best_dist + _WRONG_SONG_MARGIN < selected_dist:
+        return True, best_name
+    return False, None
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
@@ -650,6 +691,7 @@ if options:
         selected_song_path = available_songs[selected_song_name]
         song_key = selected_song_name
         display_name = selected_song_name
+    st.warning(f"📌 **Selected padyam:** {display_name} — sing **this** poem in your recording.")
     if song_key in completed_songs:
         sc = completed_songs[song_key]
         if sc is not None:
@@ -745,6 +787,11 @@ if user_id and selected_song_path:
             mfcc_user_art = _articulation_mfcc(mfcc_user_norm)
             articulation_ratio = _articulation_ratio(mfcc_ref, mfcc_user_norm)
 
+            wrong_song, best_match = False, None
+            if not is_final_test:
+                wrong_song, best_match = _detect_wrong_song(
+                    song_key, chroma_user, mfcc_user_norm, available_songs)
+
             # --- 4. DTW ON ARTICULATION MFCC — pass/fail score driver ---
             try:
                 D, wp = librosa.sequence.dtw(
@@ -791,6 +838,9 @@ if user_id and selected_song_path:
             else:
                 score = round(float(final_score), 2)
 
+            if wrong_song:
+                score = min(score, 35.0)
+
             pron_d = _path_layer_distance(mfcc_ref_art, mfcc_user_art, wp, slice(0, 9))
             pron_pct = _layer_to_pct(pron_d, *_LAYER_ANCHORS["pronunciation"])
             clear_words = (pron_pct >= MIN_PRONUNCIATION_PCT
@@ -802,7 +852,14 @@ if user_id and selected_song_path:
             )
 
             st.metric("Overall Match Score", f"{score}%")
-            st.caption(f"🎙️ Attempt #{attempt_no} for this song (this session).")
+            st.caption(f"🎙️ Attempt #{attempt_no} for this song (this session). "
+                       f"Analyzed against: **{display_name}**")
+            if wrong_song:
+                st.error(
+                    f"This recording sounds like **{best_match}**, not **{display_name}**. "
+                    f"Select the matching padyam in the dropdown and sing **that** poem, "
+                    f"or re-record the selected one."
+                )
 
             st.subheader("How you did")
             st.caption("Overall score is based on **pronunciation (clear words)** and **pacing**. "
@@ -838,9 +895,11 @@ if user_id and selected_song_path:
             voice_sig = _voice_signature(mfcc_user)
 
         # --- GOOGLE SHEETS UPSERT LOGIC ---
-        qualified = (score >= 85 and clear_words)
+        qualified = (score >= 85 and clear_words and not wrong_song)
 
-        if score >= 85 and not clear_words:
+        if wrong_song:
+            pass  # error already shown above; score capped — cannot qualify
+        elif score >= 85 and not clear_words:
             st.warning(
                 f"Score: {score}% — but **clear pronunciation is required** to qualify "
                 f"(need {MIN_PRONUNCIATION_PCT}%+ pronunciation). "
