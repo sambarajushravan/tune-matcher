@@ -24,5 +24,7 @@ test_gsheets.py
 subs/
 *.webm
 
-# Local summary doc (not part of the app)
+# Local summary docs / generated PDFs (not part of the app)
 tune_matcher_summary.pdf
+PROJECT_SUMMARY.pdf
+*.pdf
