@@ -74,19 +74,24 @@ def _final_test_enabled():
     return bool(val)
 
 
-@st.cache_data(show_spinner=False, max_entries=32)
-def _reference_features(ref_path):
-    """Load + featurize a reference track ONCE and cache it across all sessions.
-    Returns (duration_ref, hop_len, features_ref).
+# Scoring prioritizes pronunciation (MFCC) + pacing; notes/melody are coaching-only.
+TEMPO_TOLERANCE = 0.90       # penalize length mismatch beyond ~10%
+TEMPO_WEIGHT = 0.40          # pacing contributes up to 40% of the final blend
+GOOD_MATCH_DIST = 1.45       # MFCC-only anchor (correct human rendition ~1.3-1.5)
+PENALTY_SLOPE = 80.0
 
-    The reference's MFCC/chroma/pyin (pyin is the slow part) is the same for everyone,
-    so computing it once per song — instead of on every attempt — roughly halves the
-    per-attempt CPU work. That's the single biggest throughput win when many people
-    sing at the same time."""
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _reference_features(ref_path, file_mtime):
+    """Load + featurize a reference track ONCE and cache it across all sessions.
+    Returns (duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref).
+
+    file_mtime is part of the cache key so trimmed/replaced .wav files invalidate stale
+    entries (without this, pacing still referenced the old ~30s song 18 after trimming).
+
+    Scoring uses MFCC (pronunciation) only; chroma + pitch are returned for coaching."""
     y_ref, sr_ref = librosa.load(ref_path, sr=22050)
     duration_ref = librosa.get_duration(y=y_ref, sr=sr_ref)
-    # Short songs use a fine hop; the ~6-min final test uses a coarser hop so the DTW
-    # matrix stays bounded. Hop depends only on the reference, keeping this cacheable.
     hop_len = 512 if duration_ref <= 90 else 2048
 
     mfcc_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13, hop_length=hop_len)
@@ -98,8 +103,12 @@ def _reference_features(ref_path):
         f0_ref = (f0_ref - np.mean(f0_ref)) / (np.std(f0_ref) + 1e-6)
     f0_ref = f0_ref.reshape(1, -1)
     mfcc_ref = (mfcc_ref - np.mean(mfcc_ref)) / (np.std(mfcc_ref) + 1e-6)
-    features_ref = np.vstack([mfcc_ref, chroma_ref, f0_ref])
-    return duration_ref, hop_len, features_ref
+    return duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref
+
+
+def _stack_feedback_features(mfcc, chroma, f0):
+    """Full feature stack for per-layer coaching breakdown (not used in pass/fail score)."""
+    return np.vstack([mfcc, chroma, f0])
 
 
 # --- PERFORMANCE FEEDBACK (user-facing coaching, separate from final score math) ---
@@ -159,7 +168,7 @@ def _tempo_feedback(duration_ref, duration_user, time_ratio):
 
 
 def _coaching_tips(pron_pct, notes_pct, melody_pct, tempo_status, score):
-    """Short, actionable suggestions based on the weakest areas."""
+    """Short, actionable suggestions — prioritizes pronunciation and pacing."""
     tips = []
     if tempo_status == "slow":
         tips.append("Practice with the reference playing — finish each line before the reference ends.")
@@ -169,14 +178,17 @@ def _coaching_tips(pron_pct, notes_pct, melody_pct, tempo_status, score):
         tips.append("Your length is close; try matching the reference beat-for-beat.")
     if pron_pct < 85:
         tips.append("Focus on **clear pronunciation** — listen to how each syllable is shaped in the reference.")
-    if notes_pct < 85:
-        tips.append("Match the **musical notes** more closely — hum along with the reference, then sing the words.")
-    if melody_pct < 85:
-        tips.append("Follow the **melody line** — the rise and fall of your voice should match the reference tune.")
+    if pron_pct < 70:
+        tips.append("Pronunciation drives your score — sing along with the reference word-for-word.")
+    # Notes/melody are shown for guidance but do not affect pass/fail.
+    if notes_pct < 60:
+        tips.append("(Optional) Musical notes differ — hum the tune first if you want to refine further.")
+    if melody_pct < 60:
+        tips.append("(Optional) Melody line differs — follow the reference's rise and fall for polish.")
     if not tips and score < 85:
-        tips.append("You're close! Re-listen to the reference and mirror both the words and the tune together.")
+        tips.append("Focus on **pronunciation and pacing** — those drive your score.")
     if not tips:
-        tips.append("Great job — pronunciation, tune, melody, and pacing all look solid!")
+        tips.append("Great job — pronunciation and pacing look solid!")
     return tips
 
 
@@ -644,8 +656,9 @@ if user_id and selected_song_path:
         attempt_no = attempt_counts[song_key]
 
         with st.spinner("Analyzing your pronunciation, timing, and tune..."):
-            # Reference features come from the shared cache (computed once per song).
-            duration_ref, hop_len, features_ref = _reference_features(selected_song_path)
+            ref_mtime = os.path.getmtime(selected_song_path)
+            duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref = _reference_features(
+                selected_song_path, ref_mtime)
 
             try:
                 y_user, sr_user = librosa.load(io.BytesIO(audio_bytes), sr=22050)
@@ -653,12 +666,11 @@ if user_id and selected_song_path:
                 st.error("Audio decoding error. Please try recording again.")
                 st.stop()
 
-            # --- TIME CHECK (STRICT TEMPO) ---
+            # --- TIME CHECK (PACING) ---
             duration_user = librosa.get_duration(y=y_user, sr=sr_user)
             time_ratio = min(duration_ref, duration_user) / max(duration_ref, duration_user)
 
             # --- USER FEATURES (same hop as the cached reference) ---
-            # Layer A: Pronunciation (MFCC) — raw mfcc_user also feeds the voice print.
             mfcc_user = librosa.feature.mfcc(y=y_user, sr=sr_user, n_mfcc=13, hop_length=hop_len)
             # Layer B: Musical Notes (Chroma)
             chroma_user = librosa.feature.chroma_stft(y=y_user, sr=sr_user, hop_length=hop_len)
@@ -671,30 +683,24 @@ if user_id and selected_song_path:
             f0_user_norm = f0_user_norm.reshape(1, -1)
             mfcc_user_norm = (mfcc_user - np.mean(mfcc_user)) / (np.std(mfcc_user) + 1e-6)
 
-            features_user = np.vstack([mfcc_user_norm, chroma_user, f0_user_norm])
+            features_ref_fb = _stack_feedback_features(mfcc_ref, chroma_ref, f0_ref)
+            features_user_fb = _stack_feedback_features(mfcc_user_norm, chroma_user, f0_user_norm)
 
-            # --- 4. DYNAMIC TIME WARPING WITH TIMELINE CONSTRAINTS ---
-            # band_rad is a FRACTION of the longer sequence (radius = int(band_rad * max(N, M))).
-            # 0.1 == warp window of ~10% of the song length, which cuts off "cheat pathways"
-            # that let a wrong song meander to a low cost. (band_rad=10 was a no-op: it made the
-            # band 10x wider than the matrix, i.e. no constraint at all.)
+            # --- 4. DTW ON PRONUNCIATION (MFCC) ONLY — pass/fail score driver ---
             try:
                 D, wp = librosa.sequence.dtw(
-                    X=features_ref,
-                    Y=features_user,
+                    X=mfcc_ref,
+                    Y=mfcc_user_norm,
                     metric='euclidean',
                     backtrack=True,
                     global_constraints=True,
                     band_rad=0.1
                 )
             except Exception:
-                # The Sakoe-Chiba band can fail when the recording length differs a lot
-                # from the reference (e.g., a very short/partial clip). Fall back to
-                # unconstrained DTW so we still produce a score instead of crashing.
                 try:
                     D, wp = librosa.sequence.dtw(
-                        X=features_ref,
-                        Y=features_user,
+                        X=mfcc_ref,
+                        Y=mfcc_user_norm,
                         metric='euclidean',
                         backtrack=True
                     )
@@ -707,31 +713,18 @@ if user_id and selected_song_path:
             path_length = len(wp)
             norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100.0
 
-            # --- 5. COMPUTE FINAL HYBRID SCORE (ANCHOR SCALING) ---
-            # Calibrated against measured data: a CORRECT human rendition (different mic +
-            # voice than the studio reference) lands around Raw Dist ~2.00, while a WRONG
-            # song lands ~2.25+. The gap is narrow, so the anchor sits at the correct-
-            # rendition distance and the slope is gentle enough to keep good singers in the
-            # 90s while still failing wrong songs at the 85% gate (cross-over ~2.17).
-            #   GOOD_MATCH_DIST  = distance a correct rendition lands near -> ~95.
-            #   PENALTY_SLOPE    = points lost per unit of distance beyond the anchor.
-            #   TEMPO_TOLERANCE  = within 15% of the reference length => no tempo penalty
-            #                      (normal singers vary; only egregious pacing is punished).
-            GOOD_MATCH_DIST = 2.00
-            PENALTY_SLOPE = 60.0
-            TEMPO_TOLERANCE = 0.85
-
+            # --- 5. FINAL SCORE: pronunciation (MFCC) + pacing (timing blend) ---
             if norm_dist <= GOOD_MATCH_DIST:
                 base_score = 100.0 - ((norm_dist / GOOD_MATCH_DIST) * 5.0)
             else:
                 base_score = max(0.0, 95.0 - ((norm_dist - GOOD_MATCH_DIST) * PENALTY_SLOPE))
 
-            # Tempo: full credit while within tolerance, then ramp down to 0 by 50% length.
             if time_ratio >= TEMPO_TOLERANCE:
                 tempo_factor = 1.0
             else:
                 tempo_factor = max(0.0, (time_ratio - 0.5) / (TEMPO_TOLERANCE - 0.5))
-            final_score = base_score * tempo_factor
+            tempo_blend = (1.0 - TEMPO_WEIGHT) + (TEMPO_WEIGHT * tempo_factor)
+            final_score = base_score * tempo_blend
 
             # Safe NaN / Infinity boundary protection
             if np.isnan(final_score) or np.isinf(final_score):
@@ -740,7 +733,7 @@ if user_id and selected_song_path:
                 score = round(float(final_score), 2)
 
             feedback = _build_performance_feedback(
-                features_ref, features_user, wp,
+                features_ref_fb, features_user_fb, wp,
                 duration_ref, duration_user, time_ratio, score,
             )
 
@@ -748,6 +741,8 @@ if user_id and selected_song_path:
             st.caption(f"🎙️ Attempt #{attempt_no} for this song (this session).")
 
             st.subheader("How you did")
+            st.caption("Overall score is based on **pronunciation** and **pacing**. "
+                       "Musical notes and melody bars are guidance only.")
             col1, col2 = st.columns(2)
             with col1:
                 st.progress(int(feedback["pronunciation_pct"]) / 100.0,
@@ -767,8 +762,9 @@ if user_id and selected_song_path:
 
             with st.expander("Technical details (for organizers)"):
                 st.caption(
-                    f"Raw Dist: {round(norm_dist, 2)} | Tempo Acc: {round(time_ratio * 100, 1)}% | "
-                    f"Base score: {round(base_score, 1)} | Tempo factor: {round(tempo_factor, 2)}"
+                    f"Raw Dist (MFCC): {round(norm_dist, 2)} | Tempo Acc: {round(time_ratio * 100, 1)}% | "
+                    f"Base score: {round(base_score, 1)} | Tempo blend: {round(tempo_blend, 2)} | "
+                    f"Ref length: {duration_ref:.1f}s"
                 )
 
             # Rough timbre fingerprint of this recording (used only if they qualify)
