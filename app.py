@@ -102,6 +102,106 @@ def _reference_features(ref_path):
     return duration_ref, hop_len, features_ref
 
 
+# --- PERFORMANCE FEEDBACK (user-facing coaching, separate from final score math) ---
+# Feature stack layout in features_ref / features_user: MFCC (13) + Chroma (12) + Pitch (1).
+_MFCC_ROWS = slice(0, 13)
+_CHROMA_ROWS = slice(13, 25)
+_PITCH_ROWS = slice(25, 26)
+
+# Per-layer distance anchors -> friendly 0-100% labels (tuned for trimmed references).
+_LAYER_ANCHORS = {
+    "pronunciation": (1.35, 2.20),
+    "notes": (0.55, 1.10),
+    "melody": (0.45, 0.95),
+}
+
+
+def _path_layer_distance(X, Y, wp, rows):
+    """Average frame distance along the DTW path for one feature layer."""
+    dists = []
+    for r_idx, u_idx in wp:
+        dists.append(float(np.linalg.norm(X[rows, r_idx] - Y[rows, u_idx])))
+    return float(np.mean(dists)) if dists else 100.0
+
+
+def _layer_to_pct(dist, good, bad):
+    """Map a layer distance to a user-friendly 0-100% (higher = closer match)."""
+    if dist <= good:
+        return round(100.0 - (dist / good) * 8.0, 0)
+    span = max(bad - good, 1e-6)
+    return round(max(0.0, 92.0 - ((dist - good) / span) * 55.0), 0)
+
+
+def _tempo_feedback(duration_ref, duration_user, time_ratio):
+    """Return (status, user_message) for pacing."""
+    if duration_ref <= 0:
+        return "good", "Pacing matches the reference."
+    delta_pct = (duration_user - duration_ref) / duration_ref * 100.0
+    if time_ratio >= 0.85:
+        return "good", (
+            f"Pacing matches the reference well "
+            f"({duration_user:.0f}s sung vs {duration_ref:.0f}s target)."
+        )
+    if duration_user > duration_ref * 1.05:
+        return "slow", (
+            f"You sang **slower** than the reference — about {abs(delta_pct):.0f}% longer "
+            f"({duration_user:.0f}s vs {duration_ref:.0f}s). Try keeping a steadier pace."
+        )
+    if duration_user < duration_ref * 0.95:
+        return "fast", (
+            f"You sang **faster** than the reference — about {abs(delta_pct):.0f}% shorter "
+            f"({duration_user:.0f}s vs {duration_ref:.0f}s). Slow down to match the reference."
+        )
+    return "ok", (
+        f"Pacing is close ({duration_user:.0f}s vs {duration_ref:.0f}s), "
+        f"but tightening rhythm may help your score."
+    )
+
+
+def _coaching_tips(pron_pct, notes_pct, melody_pct, tempo_status, score):
+    """Short, actionable suggestions based on the weakest areas."""
+    tips = []
+    if tempo_status == "slow":
+        tips.append("Practice with the reference playing — finish each line before the reference ends.")
+    elif tempo_status == "fast":
+        tips.append("Don't rush — sing each word clearly at the reference tempo.")
+    elif tempo_status == "ok":
+        tips.append("Your length is close; try matching the reference beat-for-beat.")
+    if pron_pct < 85:
+        tips.append("Focus on **clear pronunciation** — listen to how each syllable is shaped in the reference.")
+    if notes_pct < 85:
+        tips.append("Match the **musical notes** more closely — hum along with the reference, then sing the words.")
+    if melody_pct < 85:
+        tips.append("Follow the **melody line** — the rise and fall of your voice should match the reference tune.")
+    if not tips and score < 85:
+        tips.append("You're close! Re-listen to the reference and mirror both the words and the tune together.")
+    if not tips:
+        tips.append("Great job — pronunciation, tune, melody, and pacing all look solid!")
+    return tips
+
+
+def _build_performance_feedback(features_ref, features_user, wp,
+                                duration_ref, duration_user, time_ratio, score):
+    """User-facing breakdown + coaching tips (Raw Dist kept out of main UI)."""
+    mfcc_d = _path_layer_distance(features_ref, features_user, wp, _MFCC_ROWS)
+    chroma_d = _path_layer_distance(features_ref, features_user, wp, _CHROMA_ROWS)
+    pitch_d = _path_layer_distance(features_ref, features_user, wp, _PITCH_ROWS)
+
+    pron_pct = _layer_to_pct(mfcc_d, *_LAYER_ANCHORS["pronunciation"])
+    notes_pct = _layer_to_pct(chroma_d, *_LAYER_ANCHORS["notes"])
+    melody_pct = _layer_to_pct(pitch_d, *_LAYER_ANCHORS["melody"])
+    tempo_status, tempo_msg = _tempo_feedback(duration_ref, duration_user, time_ratio)
+    tips = _coaching_tips(pron_pct, notes_pct, melody_pct, tempo_status, score)
+
+    return {
+        "pronunciation_pct": pron_pct,
+        "notes_pct": notes_pct,
+        "melody_pct": melody_pct,
+        "tempo_status": tempo_status,
+        "tempo_msg": tempo_msg,
+        "tips": tips,
+    }
+
 # --- NORMALIZATION HELPERS (for forgiving login matching) ---
 def _norm_name(value):
     """Lowercase + collapse any run of whitespace to a single space + strip.
@@ -639,9 +739,37 @@ if user_id and selected_song_path:
             else:
                 score = round(float(final_score), 2)
 
+            feedback = _build_performance_feedback(
+                features_ref, features_user, wp,
+                duration_ref, duration_user, time_ratio, score,
+            )
+
             st.metric("Overall Match Score", f"{score}%")
-            st.caption(f"Raw Dist: {round(norm_dist, 2)} | Tempo Acc: {round(time_ratio * 100, 1)}%")
             st.caption(f"🎙️ Attempt #{attempt_no} for this song (this session).")
+
+            st.subheader("How you did")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.progress(int(feedback["pronunciation_pct"]) / 100.0,
+                            text=f"🗣️ Pronunciation: {int(feedback['pronunciation_pct'])}%")
+                st.progress(int(feedback["notes_pct"]) / 100.0,
+                            text=f"🎵 Musical notes: {int(feedback['notes_pct'])}%")
+            with col2:
+                st.progress(int(feedback["melody_pct"]) / 100.0,
+                            text=f"🎼 Melody line: {int(feedback['melody_pct'])}%")
+                tempo_icon = {"good": "✅", "ok": "⚠️", "slow": "🐢", "fast": "⚡"}.get(
+                    feedback["tempo_status"], "⏱️")
+                st.info(f"{tempo_icon} **Pacing:** {feedback['tempo_msg']}")
+
+            st.markdown("**Tips to improve:**")
+            for tip in feedback["tips"]:
+                st.markdown(f"- {tip}")
+
+            with st.expander("Technical details (for organizers)"):
+                st.caption(
+                    f"Raw Dist: {round(norm_dist, 2)} | Tempo Acc: {round(time_ratio * 100, 1)}% | "
+                    f"Base score: {round(base_score, 1)} | Tempo factor: {round(tempo_factor, 2)}"
+                )
 
             # Rough timbre fingerprint of this recording (used only if they qualify)
             voice_sig = _voice_signature(mfcc_user)
