@@ -179,24 +179,40 @@ User ID | Registration ID | Song | Score | Status | Last Attempt | Voice ID | Vo
 
 ---
 
-## 6. Voice ID & Voice Print (anti-cheating heuristic)
+## 6. Voice ID & Voice Print (anti-cheating heuristic) — FAMILY-SCOPED
 
 > This is a **best-effort review flag, NOT biometric verification.** Only the
 > Name + Registration ID are required to log in and qualify. The voice data exists
-> purely so an admin can spot the same person qualifying under different names.
+> purely so an admin can spot **one person in a family singing for relatives**.
+
+**Why family-scoped?** A Registration ID can be shared by a whole family (different names,
+same ID). The goal is to catch one family member singing under another's name — *not* to
+identify people across the whole event. Voice IDs are therefore numbered **per Registration
+ID**: each family starts fresh at `Voice 1`.
 
 - **Voice Print** – A compact numeric "fingerprint" of the singer's timbre: the mean and
   standard deviation of the MFCCs, L2-normalized, stored as a comma-separated string.
-- **Voice ID** – A human-readable label (`Voice 1`, `Voice 2`, …). When someone qualifies,
-  the app compares their voice print to all stored prints using cosine similarity. If it's
-  very similar (≥ `VOICE_MATCH_THRESHOLD = 0.98`) to an existing one, that **same Voice ID**
-  is reused; otherwise a new `Voice N` label is minted.
-- **Voice Audit** – In the admin panel, if one `Voice ID` is attached to **more than one**
-  `User ID`, it's flagged in red as a possible same-singer-across-names case.
+  **MFCC coefficient 0 (overall loudness/energy) is dropped on purpose** — it is dominated
+  by the song (which everyone sings identically), and including it made every print look
+  alike and collapse onto a single "Voice 1". Dropping it lets the timbre coefficients
+  actually distinguish singers. (This changed the print length, so prints saved before this
+  change won't match new ones — clear the `Voice ID`/`Voice Print` columns once when
+  upgrading.)
+- **Voice ID** – A label (`Voice 1`, `Voice 2`, …) **scoped to one family**. When someone
+  qualifies, the app compares their print only to other prints **with the same Registration
+  ID** using cosine similarity. If it's very similar (≥ `VOICE_MATCH_THRESHOLD = 0.95`) to an
+  existing print in that family, the **same Voice ID** is reused; otherwise the next `Voice N`
+  for that family is minted. So a family of 4 distinct singers tends to get `Voice 1`–`Voice 4`,
+  while the same person singing under two names lands on a single Voice ID.
+- **Voice Audit** – In the admin panel, results are grouped by **Registration ID + Voice ID**.
+  If one `Voice ID` within a family is attached to **more than one** `User ID`, it's flagged in
+  red (with the names and songs involved) as a possible same-singer-within-a-family case.
+  `Voice 1` existing in every family is normal and is **not** flagged on its own.
 
-Caveats: the print is content-dependent (it reacts to which song/words were sung, not
-just the voice), so similarity thresholds are approximate. Treat flags as "look into this",
-not proof.
+Caveats: the print is content-dependent (it reacts to which song/words were sung, not just
+the voice), so it is approximate — different relatives can occasionally merge, and one
+person's takes can occasionally split. `VOICE_MATCH_THRESHOLD` may need tuning against real
+recordings. Treat every flag as "listen to this", not proof.
 
 > **About the unreadable Voice Print column:** it is intentionally not human-readable — it
 > is the feature vector the matching needs. Voice ID is *derived from* it, so you cannot

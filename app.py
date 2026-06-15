@@ -142,12 +142,28 @@ def authenticate(username, password):
 
 # --- VOICE FINGERPRINT HELPERS (best-effort, for admin duplicate-singer review) ---
 # NOTE: this is a lightweight timbre signature (MFCC mean+std), NOT biometric-grade
-# speaker verification. It is content-dependent, so treat it as an admin review flag.
-VOICE_MATCH_THRESHOLD = 0.98  # cosine similarity above which two prints are "same voice"
+# speaker verification. It is content-dependent (everyone sings the same songs), so it
+# is only reliable enough to be a REVIEW HINT — not proof. Voice IDs are scoped PER
+# FAMILY (Registration ID): within one family the first singer is "Voice 1", a clearly
+# different singer is "Voice 2", etc. If the same person sings under two names in the
+# same family, both rows land on the same Voice ID, which the admin audit surfaces.
+#
+# Tuning: this threshold needs calibrating against real recordings. If genuinely
+# different family members keep collapsing onto one Voice ID, raise it; if one person's
+# takes keep splitting into many voices, lower it.
+VOICE_MATCH_THRESHOLD = 0.95  # cosine similarity above which two prints are "same voice"
 
 
 def _voice_signature(mfcc):
-    """Compact, L2-normalized timbre signature from MFCC mean + std over time."""
+    """Compact, L2-normalized timbre signature from MFCC mean + std over time.
+
+    Coefficient 0 (overall loudness/energy) is dropped on purpose: it is dominated by
+    the SONG (which everyone sings identically) rather than the singer, and including it
+    made every print point in nearly the same direction — collapsing everyone onto
+    'Voice 1'. Dropping it lets the higher coefficients (vocal-tract timbre) actually
+    discriminate between people."""
+    if mfcc.shape[0] > 1:
+        mfcc = mfcc[1:]  # drop c0 (energy) — keep the timbre coefficients
     sig = np.concatenate([mfcc.mean(axis=1), mfcc.std(axis=1)])
     norm = np.linalg.norm(sig)
     return sig / norm if norm > 0 else sig
@@ -165,14 +181,24 @@ def _parse_voice(text):
         return None
 
 
-def _assign_voice_id(df, new_sig):
-    """Nearest-neighbour match against stored Voice Prints.
-    Returns (voice_id, matched_user_id_or_None). Reuses an existing Voice ID if a very
-    similar print exists, otherwise mints the next 'Voice N' label."""
+def _assign_voice_id(df, new_sig, reg_id):
+    """Nearest-neighbour match against stored Voice Prints WITHIN THE SAME FAMILY.
+
+    Comparison and 'Voice N' numbering are both scoped to the given Registration ID, so:
+      - a family of 4 distinct singers tends to get Voice 1..Voice 4,
+      - one person singing under two names in that family lands on a single Voice ID
+        (the cheating signal the admin audit flags),
+      - and different families never contaminate each other (every family starts at
+        Voice 1, which is why the audit groups by Registration ID + Voice ID).
+
+    Returns (voice_id, matched_user_id_or_None)."""
+    target_reg = _norm_pwd(reg_id)
     best_sim, best_id, best_user = -1.0, None, None
     max_n = 0
     if "Voice ID" in df.columns and "Voice Print" in df.columns:
         for _, r in df.iterrows():
+            if _norm_pwd(r.get("Registration ID", "")) != target_reg:
+                continue  # only compare within the same family (Registration ID)
             vid = str(r.get("Voice ID", "")).strip()
             if vid:
                 m = re.match(r"[Vv]oice\s+(\d+)", vid)
@@ -208,7 +234,7 @@ def _save_qualification(user_id, reg_id, song_key, score, voice_sig,
             df[col] = pd.Series(dtype="object")
 
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    voice_id, _matched_user = _assign_voice_id(df, voice_sig)
+    voice_id, _matched_user = _assign_voice_id(df, voice_sig, reg_id)
     voice_str = _voice_to_str(voice_sig)
 
     def _row_values(reg):
@@ -342,21 +368,30 @@ with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
                     song_counts = passes_df["Song"].value_counts()
                     st.bar_chart(song_counts)
 
-                    # Voice Audit: flag a single voice qualifying under multiple usernames.
-                    st.subheader("🕵️ Voice Audit (possible same singer across names)")
-                    if "Voice ID" in passes_df.columns:
+                    # Voice Audit: within a family (Registration ID), flag a single
+                    # Voice ID that qualified under more than one name — i.e. one person
+                    # likely singing for relatives who share the Registration ID. Voice
+                    # IDs are family-scoped, so we group by Registration ID + Voice ID
+                    # ("Voice 1" exists in every family and is not itself suspicious).
+                    # This is a REVIEW HINT, not proof — listen to the recordings before
+                    # acting on it.
+                    st.subheader("🕵️ Voice Audit (possible same singer within a family)")
+                    if {"Voice ID", "Registration ID"}.issubset(passes_df.columns):
                         va = passes_df[passes_df["Voice ID"].astype(str).str.strip() != ""]
+                        flagged_any = False
                         if not va.empty:
-                            grouped = va.groupby("Voice ID")["User ID"].nunique()
-                            flagged = grouped[grouped > 1]
-                            if not flagged.empty:
-                                for vid, n in flagged.items():
-                                    users = sorted(va[va["Voice ID"] == vid]["User ID"].unique())
-                                    st.error(f"{vid}: same voice qualified under {n} names → {', '.join(users)}")
-                            else:
-                                st.success("No duplicate voices detected across different users.")
-                        else:
-                            st.info("No voice fingerprints recorded yet.")
+                            for (reg, vid), grp in va.groupby(["Registration ID", "Voice ID"]):
+                                names = sorted(grp["User ID"].astype(str).str.strip().unique())
+                                if len(names) > 1:
+                                    flagged_any = True
+                                    songs = sorted(grp["Song"].astype(str).str.strip().unique())
+                                    st.error(
+                                        f"Registration {reg} · {vid}: one voice qualified "
+                                        f"under {len(names)} names → {', '.join(names)} "
+                                        f"(songs: {', '.join(songs)})"
+                                    )
+                        if not flagged_any:
+                            st.success("No within-family duplicate voices detected.")
                     else:
                         st.info("No voice fingerprints recorded yet.")
 
