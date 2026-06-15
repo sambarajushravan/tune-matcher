@@ -47,19 +47,26 @@ def _read_records():
 
 
 def _get_user_progress(user_id):
-    """One read of the sheet -> (set of individual songs this user has QUALIFIED,
-    bool whether they passed the Final Test). Called once per login; kept fresh
-    in-session afterwards so we don't re-read on every rerun."""
-    completed, final_done = set(), False
+    """One read of the sheet -> (qualified song->score dict, final_done, final_score)."""
+    completed, final_done, final_score = {}, False, None
     for r in _read_records():
         if (str(r.get("User ID", "")).strip() == user_id
                 and str(r.get("Status", "")).strip() == "QUALIFIED"):
             s = str(r.get("Song", "")).strip()
+            try:
+                sc = float(r.get("Score"))
+            except (TypeError, ValueError):
+                sc = None
             if s == FINAL_TEST_KEY:
                 final_done = True
+                if sc is not None:
+                    final_score = sc
             elif s:
-                completed.add(s)
-    return completed, final_done
+                if sc is not None:
+                    completed[s] = max(completed.get(s, 0.0), sc)
+                elif s not in completed:
+                    completed[s] = None
+    return completed, final_done, final_score
 
 
 def _final_test_enabled():
@@ -74,11 +81,16 @@ def _final_test_enabled():
     return bool(val)
 
 
-# Scoring prioritizes pronunciation (MFCC) + pacing; notes/melody are coaching-only.
-TEMPO_TOLERANCE = 0.90       # penalize length mismatch beyond ~10%
-TEMPO_WEIGHT = 0.40          # pacing contributes up to 40% of the final blend
-GOOD_MATCH_DIST = 1.45       # MFCC-only anchor (correct human rendition ~1.3-1.5)
-PENALTY_SLOPE = 80.0
+# Scoring prioritizes pronunciation (articulation MFCC) + pacing.
+TEMPO_TOLERANCE = 0.90
+TEMPO_WEIGHT = 0.40
+GOOD_MATCH_DIST = 1.30       # articulation MFCC anchor (coeffs 4–12)
+PENALTY_SLOPE = 85.0
+MIN_PRONUNCIATION_PCT = 88     # must sing words clearly — humming/mumbling blocked
+MIN_ARTICULATION_RATIO = 0.68  # user syllable variation vs reference (hums are too flat)
+
+# MFCC rows used for pass/fail (skip c0–c3: energy/broad spectrum — humming matches these).
+_ARTICULATION_ROWS = slice(4, 13)
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
@@ -106,20 +118,28 @@ def _reference_features(ref_path, file_mtime):
     return duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref
 
 
-def _stack_feedback_features(mfcc, chroma, f0):
-    """Full feature stack for per-layer coaching breakdown (not used in pass/fail score)."""
-    return np.vstack([mfcc, chroma, f0])
+def _articulation_mfcc(mfcc):
+    """Higher MFCC coefficients — sensitive to consonants/vowels; humming lacks these."""
+    return mfcc[_ARTICULATION_ROWS]
+
+
+def _articulation_ratio(mfcc_ref, mfcc_user):
+    """Frame-to-frame MFCC variation vs reference. Humming/mumbling scores low."""
+    ref_v = float(np.mean(np.std(mfcc_ref, axis=1)))
+    user_v = float(np.mean(np.std(mfcc_user, axis=1)))
+    return user_v / (ref_v + 1e-6)
+
+
+def _qualified_label(name, score):
+    """Dropdown / list label for a passed song, including score when known."""
+    if score is None:
+        return f"✅ {name}"
+    return f"✅ {name} ({score:.1f}%)"
 
 
 # --- PERFORMANCE FEEDBACK (user-facing coaching, separate from final score math) ---
-# Feature stack layout in features_ref / features_user: MFCC (13) + Chroma (12) + Pitch (1).
-_MFCC_ROWS = slice(0, 13)
-_CHROMA_ROWS = slice(13, 25)
-_PITCH_ROWS = slice(25, 26)
-
-# Per-layer distance anchors -> friendly 0-100% labels (tuned for trimmed references).
 _LAYER_ANCHORS = {
-    "pronunciation": (1.35, 2.20),
+    "pronunciation": (1.15, 1.85),   # articulation MFCC (stricter — catches humming)
     "notes": (0.55, 1.10),
     "melody": (0.45, 0.95),
 }
@@ -167,22 +187,23 @@ def _tempo_feedback(duration_ref, duration_user, time_ratio):
     )
 
 
-def _coaching_tips(pron_pct, notes_pct, melody_pct, tempo_status, score):
+def _coaching_tips(pron_pct, notes_pct, melody_pct, tempo_status, score, clear_words):
     """Short, actionable suggestions — prioritizes pronunciation and pacing."""
     tips = []
+    if not clear_words:
+        tips.append("**Sing every word clearly** — humming or mumbling the tune alone won't qualify.")
     if tempo_status == "slow":
         tips.append("Practice with the reference playing — finish each line before the reference ends.")
     elif tempo_status == "fast":
         tips.append("Don't rush — sing each word clearly at the reference tempo.")
     elif tempo_status == "ok":
         tips.append("Your length is close; try matching the reference beat-for-beat.")
-    if pron_pct < 85:
+    if pron_pct < MIN_PRONUNCIATION_PCT:
         tips.append("Focus on **clear pronunciation** — listen to how each syllable is shaped in the reference.")
-    if pron_pct < 70:
-        tips.append("Pronunciation drives your score — sing along with the reference word-for-word.")
-    # Notes/melody are shown for guidance but do not affect pass/fail.
+    elif pron_pct < 85:
+        tips.append("Pronunciation needs work — sing along with the reference word-for-word, not just the melody.")
     if notes_pct < 60:
-        tips.append("(Optional) Musical notes differ — hum the tune first if you want to refine further.")
+        tips.append("(Optional) Musical notes differ — for polish, hum the tune first, then sing the words.")
     if melody_pct < 60:
         tips.append("(Optional) Melody line differs — follow the reference's rise and fall for polish.")
     if not tips and score < 85:
@@ -192,18 +213,21 @@ def _coaching_tips(pron_pct, notes_pct, melody_pct, tempo_status, score):
     return tips
 
 
-def _build_performance_feedback(features_ref, features_user, wp,
-                                duration_ref, duration_user, time_ratio, score):
+def _build_performance_feedback(mfcc_ref, mfcc_user, chroma_ref, chroma_user,
+                                  f0_ref, f0_user, wp,
+                                  duration_ref, duration_user, time_ratio, score,
+                                  clear_words):
     """User-facing breakdown + coaching tips (Raw Dist kept out of main UI)."""
-    mfcc_d = _path_layer_distance(features_ref, features_user, wp, _MFCC_ROWS)
-    chroma_d = _path_layer_distance(features_ref, features_user, wp, _CHROMA_ROWS)
-    pitch_d = _path_layer_distance(features_ref, features_user, wp, _PITCH_ROWS)
+    pron_d = _path_layer_distance(_articulation_mfcc(mfcc_ref), _articulation_mfcc(mfcc_user),
+                                  wp, slice(0, 9))
+    chroma_d = _path_layer_distance(chroma_ref, chroma_user, wp, slice(0, chroma_ref.shape[0]))
+    pitch_d = _path_layer_distance(f0_ref, f0_user, wp, slice(0, 1))
 
-    pron_pct = _layer_to_pct(mfcc_d, *_LAYER_ANCHORS["pronunciation"])
+    pron_pct = _layer_to_pct(pron_d, *_LAYER_ANCHORS["pronunciation"])
     notes_pct = _layer_to_pct(chroma_d, *_LAYER_ANCHORS["notes"])
     melody_pct = _layer_to_pct(pitch_d, *_LAYER_ANCHORS["melody"])
     tempo_status, tempo_msg = _tempo_feedback(duration_ref, duration_user, time_ratio)
-    tips = _coaching_tips(pron_pct, notes_pct, melody_pct, tempo_status, score)
+    tips = _coaching_tips(pron_pct, notes_pct, melody_pct, tempo_status, score, clear_words)
 
     return {
         "pronunciation_pct": pron_pct,
@@ -429,8 +453,9 @@ if not st.session_state.authenticated:
                 st.session_state.user_id = result[0]
                 st.session_state.registration_id = result[1]
                 st.session_state.attempt_counts = {}  # fresh attempt tally per login
-                st.session_state.pop("completed_songs", None)  # force a fresh progress read
+                st.session_state.pop("completed_songs", None)
                 st.session_state.pop("final_done", None)
+                st.session_state.pop("final_score", None)
                 st.rerun()
             else:
                 st.error("Name or Registration ID is incorrect. Please check and try again.")
@@ -533,6 +558,7 @@ if logout_col.button("Log out"):
     st.session_state.attempt_counts = {}
     st.session_state.pop("completed_songs", None)
     st.session_state.pop("final_done", None)
+    st.session_state.pop("final_score", None)
     st.rerun()
 
 # --- DYNAMIC SONG LOADING ---
@@ -554,13 +580,14 @@ else:
 # then kept fresh in-session as they pass more songs, so we never re-read on reruns.
 if "completed_songs" not in st.session_state:
     try:
-        completed, final_done = _get_user_progress(user_id)
+        completed, final_done, final_score = _get_user_progress(user_id)
     except Exception:
-        completed, final_done = set(), False
+        completed, final_done, final_score = {}, False, None
     st.session_state.completed_songs = completed
     st.session_state.final_done = final_done
+    st.session_state.final_score = final_score
 
-completed_songs = st.session_state.completed_songs
+completed_songs = st.session_state.completed_songs  # dict: song_key -> score (or None)
 
 # Progress summary + lists of what's done and what's left.
 total_songs = len(available_songs)
@@ -570,7 +597,12 @@ st.progress(len(done_here) / total_songs if total_songs else 0.0,
             text=f"Completed {len(done_here)} of {total_songs} songs")
 if done_here:
     with st.expander(f"✅ Completed songs ({len(done_here)})"):
-        st.write("\n".join(f"- {n}" for n in done_here))
+        for n in done_here:
+            sc = completed_songs.get(n)
+            if sc is not None:
+                st.write(f"- {n} — **{sc:.1f}%**")
+            else:
+                st.write(f"- {n}")
 if remaining:
     with st.expander(f"🎯 Remaining songs ({len(remaining)})"):
         st.write("\n".join(f"- {n}" for n in remaining))
@@ -585,13 +617,16 @@ display_name = None   # friendly name used in user-facing messages
 label_to_name = {}
 options = []
 for name in available_songs:
-    label = f"✅ {name}" if name in completed_songs else name
+    label = _qualified_label(name, completed_songs.get(name)) if name in completed_songs else name
     label_to_name[label] = name
     options.append(label)
 # Final Test is only offered when its combined track exists AND it is enabled in
 # secrets ([features] final_test = true). Off by default; enable on demand.
 if os.path.exists(FINAL_TEST_PATH) and _final_test_enabled():
-    final_label = ("✅ " + FINAL_TEST_LABEL) if st.session_state.get("final_done") else FINAL_TEST_LABEL
+    if st.session_state.get("final_done"):
+        final_label = _qualified_label(FINAL_TEST_LABEL, st.session_state.get("final_score"))
+    else:
+        final_label = FINAL_TEST_LABEL
     label_to_name[final_label] = FINAL_TEST_LABEL
     options.append(final_label)
 
@@ -616,7 +651,11 @@ if options:
         song_key = selected_song_name
         display_name = selected_song_name
     if song_key in completed_songs:
-        st.info(f"You've already qualified for this song. Re-sing only if you want a higher score.")
+        sc = completed_songs[song_key]
+        if sc is not None:
+            st.info(f"You've already qualified for this song with **{sc:.1f}%**.")
+        else:
+            st.info("You've already qualified for this song.")
 else:
     st.warning("No songs found in the /songs folder.")
 
@@ -632,12 +671,32 @@ if user_id and selected_song_path:
     except Exception:
         pass
 
-    st.write("Tap the mic, sing the **whole** song, then press the stop button when "
-             "you're done. Nothing is analyzed until you press **Analyze**.")
-    # st.audio_input lets the SINGER start/stop manually, so it never uploads a partial
-    # clip mid-song (the old recorder auto-stopped on a short pause). Per-song key resets
-    # it when the song changes; native widget => no third-party state quirks, scales fine.
-    audio_value = st.audio_input("Record your singing", key=f"recorder_{song_key}")
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stAudioInput"] {
+            border: 3px solid #e63946;
+            border-radius: 14px;
+            padding: 16px 14px 10px;
+            background: linear-gradient(180deg, #fff5f5 0%, #ffffff 100%);
+            box-shadow: 0 2px 10px rgba(230, 57, 70, 0.15);
+        }
+        div[data-testid="stAudioInput"] label p {
+            font-size: 1.15rem !important;
+            font-weight: 700 !important;
+            color: #b00020 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(border=True):
+        st.markdown("### 🎤 Step 2 — Record your singing")
+        st.markdown(
+            "**Tap the red microphone below**, sing the **whole padyam with clear words**, "
+            "then tap **stop**. Nothing is analyzed until you press **Analyze**."
+        )
+        audio_value = st.audio_input("🎙️ Tap here to start recording", key=f"recorder_{song_key}")
 
     # Explicit confirm step: nothing is analyzed until they press Analyze, so they can
     # re-record if they stopped too early ("cancel before analysis").
@@ -682,15 +741,15 @@ if user_id and selected_song_path:
             f0_user_norm = (f0_user - np.mean(f0_user)) / (np.std(f0_user) + 1e-6) if np.std(f0_user) > 0 else f0_user
             f0_user_norm = f0_user_norm.reshape(1, -1)
             mfcc_user_norm = (mfcc_user - np.mean(mfcc_user)) / (np.std(mfcc_user) + 1e-6)
+            mfcc_ref_art = _articulation_mfcc(mfcc_ref)
+            mfcc_user_art = _articulation_mfcc(mfcc_user_norm)
+            articulation_ratio = _articulation_ratio(mfcc_ref, mfcc_user_norm)
 
-            features_ref_fb = _stack_feedback_features(mfcc_ref, chroma_ref, f0_ref)
-            features_user_fb = _stack_feedback_features(mfcc_user_norm, chroma_user, f0_user_norm)
-
-            # --- 4. DTW ON PRONUNCIATION (MFCC) ONLY — pass/fail score driver ---
+            # --- 4. DTW ON ARTICULATION MFCC — pass/fail score driver ---
             try:
                 D, wp = librosa.sequence.dtw(
-                    X=mfcc_ref,
-                    Y=mfcc_user_norm,
+                    X=mfcc_ref_art,
+                    Y=mfcc_user_art,
                     metric='euclidean',
                     backtrack=True,
                     global_constraints=True,
@@ -699,8 +758,8 @@ if user_id and selected_song_path:
             except Exception:
                 try:
                     D, wp = librosa.sequence.dtw(
-                        X=mfcc_ref,
-                        Y=mfcc_user_norm,
+                        X=mfcc_ref_art,
+                        Y=mfcc_user_art,
                         metric='euclidean',
                         backtrack=True
                     )
@@ -713,7 +772,7 @@ if user_id and selected_song_path:
             path_length = len(wp)
             norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100.0
 
-            # --- 5. FINAL SCORE: pronunciation (MFCC) + pacing (timing blend) ---
+            # --- 5. FINAL SCORE: articulation (word clarity) + pacing ---
             if norm_dist <= GOOD_MATCH_DIST:
                 base_score = 100.0 - ((norm_dist / GOOD_MATCH_DIST) * 5.0)
             else:
@@ -732,16 +791,22 @@ if user_id and selected_song_path:
             else:
                 score = round(float(final_score), 2)
 
+            pron_d = _path_layer_distance(mfcc_ref_art, mfcc_user_art, wp, slice(0, 9))
+            pron_pct = _layer_to_pct(pron_d, *_LAYER_ANCHORS["pronunciation"])
+            clear_words = (pron_pct >= MIN_PRONUNCIATION_PCT
+                           and articulation_ratio >= MIN_ARTICULATION_RATIO)
+
             feedback = _build_performance_feedback(
-                features_ref_fb, features_user_fb, wp,
-                duration_ref, duration_user, time_ratio, score,
+                mfcc_ref, mfcc_user_norm, chroma_ref, chroma_user, f0_ref, f0_user_norm, wp,
+                duration_ref, duration_user, time_ratio, score, clear_words,
             )
 
             st.metric("Overall Match Score", f"{score}%")
             st.caption(f"🎙️ Attempt #{attempt_no} for this song (this session).")
 
             st.subheader("How you did")
-            st.caption("Overall score is based on **pronunciation** and **pacing**. "
+            st.caption("Overall score is based on **pronunciation (clear words)** and **pacing**. "
+                       "You must sing the words — humming won't qualify. "
                        "Musical notes and melody bars are guidance only.")
             col1, col2 = st.columns(2)
             with col1:
@@ -762,7 +827,9 @@ if user_id and selected_song_path:
 
             with st.expander("Technical details (for organizers)"):
                 st.caption(
-                    f"Raw Dist (MFCC): {round(norm_dist, 2)} | Tempo Acc: {round(time_ratio * 100, 1)}% | "
+                    f"Raw Dist (articulation MFCC): {round(norm_dist, 2)} | "
+                    f"Tempo Acc: {round(time_ratio * 100, 1)}% | "
+                    f"Articulation ratio: {round(articulation_ratio, 2)} | "
                     f"Base score: {round(base_score, 1)} | Tempo blend: {round(tempo_blend, 2)} | "
                     f"Ref length: {duration_ref:.1f}s"
                 )
@@ -771,7 +838,15 @@ if user_id and selected_song_path:
             voice_sig = _voice_signature(mfcc_user)
 
         # --- GOOGLE SHEETS UPSERT LOGIC ---
-        if score >= 85:
+        qualified = (score >= 85 and clear_words)
+
+        if score >= 85 and not clear_words:
+            st.warning(
+                f"Score: {score}% — but **clear pronunciation is required** to qualify "
+                f"(need {MIN_PRONUNCIATION_PCT}%+ pronunciation). "
+                f"**Sing every word** — humming or mumbling the tune alone won't pass."
+            )
+        elif qualified:
             st.balloons()
             st.success(f"🎉 PASS! You qualified for {display_name} with {score}%!")
 
@@ -782,7 +857,7 @@ if user_id and selected_song_path:
             if is_final_test:
                 already_passed = bool(st.session_state.get("final_done"))
             else:
-                already_passed = song_key in st.session_state.get("completed_songs", set())
+                already_passed = song_key in st.session_state.get("completed_songs", {})
 
             if already_passed:
                 st.info("You've already qualified for this earlier — keeping your existing "
@@ -804,9 +879,11 @@ if user_id and selected_song_path:
                     # Keep in-session progress fresh so ✅ marks update without a re-read.
                     if is_final_test:
                         st.session_state.final_done = True
+                        st.session_state.final_score = score
                     else:
-                        st.session_state.completed_songs = set(
-                            st.session_state.get("completed_songs", set())) | {song_key}
+                        updated = dict(st.session_state.get("completed_songs", {}))
+                        updated[song_key] = score
+                        st.session_state.completed_songs = updated
 
                     if is_final_test:
                         st.snow()
