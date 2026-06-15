@@ -608,21 +608,30 @@ if user_id and selected_song_path:
             norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100.0
 
             # --- 5. COMPUTE FINAL HYBRID SCORE (ANCHOR SCALING) ---
-            # GOOD_MATCH_DIST = distance a correct rendition lands near (~1.90).
-            # PENALTY_SLOPE   = how fast the score collapses once past the anchor.
-            # Gentle slope: keeps correct attempts (whose raw dist varies a bit) in the 90s
-            # while still dropping wrong songs (~2.15) below 50. Worst case for a wrong song
-            # is 0 once its distance is large enough.
-            GOOD_MATCH_DIST = 1.90
-            PENALTY_SLOPE = 150.0
+            # Calibrated against measured data: a CORRECT human rendition (different mic +
+            # voice than the studio reference) lands around Raw Dist ~2.00, while a WRONG
+            # song lands ~2.25+. The gap is narrow, so the anchor sits at the correct-
+            # rendition distance and the slope is gentle enough to keep good singers in the
+            # 90s while still failing wrong songs at the 85% gate (cross-over ~2.17).
+            #   GOOD_MATCH_DIST  = distance a correct rendition lands near -> ~95.
+            #   PENALTY_SLOPE    = points lost per unit of distance beyond the anchor.
+            #   TEMPO_TOLERANCE  = within 15% of the reference length => no tempo penalty
+            #                      (normal singers vary; only egregious pacing is punished).
+            GOOD_MATCH_DIST = 2.00
+            PENALTY_SLOPE = 60.0
+            TEMPO_TOLERANCE = 0.85
 
             if norm_dist <= GOOD_MATCH_DIST:
                 base_score = 100.0 - ((norm_dist / GOOD_MATCH_DIST) * 5.0)
             else:
                 base_score = max(0.0, 95.0 - ((norm_dist - GOOD_MATCH_DIST) * PENALTY_SLOPE))
 
-            # Apply tempo accuracy multiplier
-            final_score = base_score * time_ratio
+            # Tempo: full credit while within tolerance, then ramp down to 0 by 50% length.
+            if time_ratio >= TEMPO_TOLERANCE:
+                tempo_factor = 1.0
+            else:
+                tempo_factor = max(0.0, (time_ratio - 0.5) / (TEMPO_TOLERANCE - 0.5))
+            final_score = base_score * tempo_factor
 
             # Safe NaN / Infinity boundary protection
             if np.isnan(final_score) or np.isinf(final_score):
