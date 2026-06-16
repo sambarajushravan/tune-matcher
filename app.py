@@ -6,6 +6,7 @@ from google.oauth2.service_account import Credentials
 import io
 import os
 import re
+import hashlib
 import datetime
 import pandas as pd
 
@@ -92,7 +93,9 @@ MIN_ARTICULATION_RATIO = 0.68  # user syllable variation vs reference (hums are 
 # MFCC rows used for pass/fail (skip c0–c3: energy/broad spectrum — humming matches these).
 _ARTICULATION_ROWS = slice(4, 13)
 # Selected poem must beat every other poem by at least this identity distance margin.
-_WRONG_SONG_MARGIN = 0.04
+_WRONG_SONG_MARGIN = 0.06
+# Other poem must be at least this fraction better than selected (8% closer match).
+_WRONG_SONG_REL_RATIO = 0.92
 
 
 def _dtw_norm_dist(X, Y):
@@ -114,11 +117,10 @@ def _song_identity_matrix(chroma, mfcc):
 
 
 def _detect_wrong_song(song_key, chroma_user, mfcc_user_norm, available_songs):
-    """Return (is_wrong, best_match_name).
+    """Return (is_wrong, best_match_name, selected_dist, best_dist).
 
-    Compares the recording against every reference. If another padyam is a clearly
-    better match than the one selected in the dropdown, the singer likely performed
-    the wrong poem (e.g. sang poem 1 while poem 2 was selected)."""
+    Compares the recording against every reference. Flags wrong poem only when
+    another padyam is a clearly better match than the dropdown selection."""
     ident_user = _song_identity_matrix(chroma_user, mfcc_user_norm)
     dists = {}
     for name, path in available_songs.items():
@@ -130,9 +132,11 @@ def _detect_wrong_song(song_key, chroma_user, mfcc_user_norm, available_songs):
     selected_dist = dists[song_key]
     best_name = min(dists, key=dists.get)
     best_dist = dists[best_name]
-    if best_name != song_key and best_dist + _WRONG_SONG_MARGIN < selected_dist:
-        return True, best_name
-    return False, None
+    if (best_name != song_key
+            and best_dist < selected_dist * _WRONG_SONG_REL_RATIO
+            and best_dist + _WRONG_SONG_MARGIN < selected_dist):
+        return True, best_name, selected_dist, best_dist
+    return False, None, selected_dist, best_dist
 
 
 # Bump when reference .wav files change (trim/replace) to bust stale Streamlit caches.
@@ -739,6 +743,13 @@ if user_id and selected_song_path:
     except Exception:
         pass
 
+    # Reset the mic widget when the dropdown changes so an old recording cannot
+    # be analyzed against a newly selected padyam.
+    if st.session_state.get("_active_song") != song_key:
+        st.session_state["_active_song"] = song_key
+        st.session_state["_rec_nonce"] = st.session_state.get("_rec_nonce", 0) + 1
+    rec_nonce = st.session_state["_rec_nonce"]
+
     st.markdown(
         """
         <style>
@@ -780,18 +791,34 @@ if user_id and selected_song_path:
             "Nothing is analyzed until you press **Analyze**."
         )
         audio_value = st.audio_input("Tap the microphone button to start recording",
-                                     key=f"recorder_{song_key}")
+                                     key=f"recorder_{song_key}_{rec_nonce}")
 
-    # Explicit confirm step: nothing is analyzed until they press Analyze, so they can
-    # re-record if they stopped too early ("cancel before analysis").
-    do_analyze = audio_value is not None and st.button(
-        "✅ Analyze my recording", key=f"analyze_{song_key}")
+    rec_col1, rec_col2 = st.columns(2)
+    with rec_col1:
+        do_analyze = audio_value is not None and st.button(
+            "✅ Analyze my recording", key=f"analyze_{song_key}_{rec_nonce}")
+    with rec_col2:
+        if st.button("🔄 Discard & record again", key=f"reset_rec_{song_key}_{rec_nonce}"):
+            st.session_state["_rec_nonce"] = rec_nonce + 1
+            st.session_state.pop(f"_audio_hash_{song_key}", None)
+            st.session_state.pop(f"_last_wrong_{song_key}", None)
+            st.rerun()
     if audio_value is not None and not do_analyze:
-        st.caption("Recorded. Press **Analyze** when ready — or just record again if you "
-                   "stopped before the song finished.")
+        st.caption("Recorded. Press **Analyze** when ready — or **Discard & record again** "
+                   "if you sang the wrong padyam or want a fresh take.")
 
     if do_analyze:
         audio_bytes = audio_value.getvalue()
+        audio_hash = hashlib.md5(audio_bytes).hexdigest()
+        hash_key = f"_audio_hash_{song_key}"
+        if (st.session_state.get(hash_key) == audio_hash
+                and st.session_state.get(f"_last_wrong_{song_key}")):
+            st.warning(
+                "This is the **same recording** as your last attempt. "
+                "Tap **Discard & record again**, then sing the **selected padyam** before analyzing."
+            )
+            st.stop()
+        st.session_state[hash_key] = audio_hash
 
         # Live, per-session attempt counter (no sheet writes, no API calls).
         attempt_counts = st.session_state.setdefault("attempt_counts", {})
@@ -828,11 +855,6 @@ if user_id and selected_song_path:
             mfcc_user_art = _articulation_mfcc(mfcc_user_norm)
             articulation_ratio = _articulation_ratio(mfcc_ref, mfcc_user_norm)
 
-            wrong_song, best_match = False, None
-            if not is_final_test:
-                wrong_song, best_match = _detect_wrong_song(
-                    song_key, chroma_user, mfcc_user_norm, available_songs)
-
             # --- 4. DTW ON ARTICULATION MFCC — pass/fail score driver ---
             try:
                 D, wp = librosa.sequence.dtw(
@@ -860,6 +882,16 @@ if user_id and selected_song_path:
             path_length = len(wp)
             norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100.0
 
+            # --- Wrong-poem check (after we know how well they match the SELECTED ref) ---
+            wrong_song, best_match = False, None
+            if not is_final_test:
+                wrong_song, best_match, _, _ = _detect_wrong_song(
+                    song_key, chroma_user, mfcc_user_norm, available_songs)
+                # Strong direct match to the selected reference overrides identity scan
+                # (prevents false "wrong poem" after a good take or with phone-mic noise).
+                if wrong_song and norm_dist <= GOOD_MATCH_DIST * 1.2:
+                    wrong_song, best_match = False, None
+
             # --- 5. FINAL SCORE: articulation (word clarity) + pacing ---
             if norm_dist <= GOOD_MATCH_DIST:
                 base_score = 100.0 - ((norm_dist / GOOD_MATCH_DIST) * 5.0)
@@ -881,6 +913,9 @@ if user_id and selected_song_path:
 
             if wrong_song:
                 score = min(score, 35.0)
+                st.session_state[f"_last_wrong_{song_key}"] = True
+            else:
+                st.session_state.pop(f"_last_wrong_{song_key}", None)
 
             pron_d = _path_layer_distance(mfcc_ref_art, mfcc_user_art, wp, slice(0, 9))
             pron_pct = _layer_to_pct(pron_d, *_LAYER_ANCHORS["pronunciation"])
@@ -898,8 +933,7 @@ if user_id and selected_song_path:
             if wrong_song:
                 st.error(
                     f"This recording sounds like **{best_match}**, not **{display_name}**. "
-                    f"Select the matching padyam in the dropdown and sing **that** poem, "
-                    f"or re-record the selected one."
+                    f"Tap **Discard & record again**, then sing the **selected** padyam."
                 )
 
             st.subheader("How you did")
