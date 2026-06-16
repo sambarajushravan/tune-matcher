@@ -122,8 +122,9 @@ def _detect_wrong_song(song_key, chroma_user, mfcc_user_norm, available_songs):
     ident_user = _song_identity_matrix(chroma_user, mfcc_user_norm)
     dists = {}
     for name, path in available_songs.items():
-        mtime = os.path.getmtime(path)
-        _, _, mfcc_r, chroma_r, _ = _reference_features(path, mtime)
+        mtime, fsize = _ref_file_key(path)
+        _, _, mfcc_r, chroma_r, _ = _reference_features(
+            path, mtime, fsize, SONGS_CACHE_VERSION)
         dists[name] = _dtw_norm_dist(_song_identity_matrix(chroma_r, mfcc_r), ident_user)
 
     selected_dist = dists[song_key]
@@ -134,15 +135,22 @@ def _detect_wrong_song(song_key, chroma_user, mfcc_user_norm, available_songs):
     return False, None
 
 
+# Bump when reference .wav files change (trim/replace) to bust stale Streamlit caches.
+SONGS_CACHE_VERSION = 2
+
+
+def _ref_file_key(path):
+    """Cache-bust key from file identity (mtime + size)."""
+    return os.path.getmtime(path), os.path.getsize(path)
+
+
 @st.cache_data(show_spinner=False, max_entries=32)
-def _reference_features(ref_path, file_mtime):
+def _reference_features(ref_path, file_mtime, file_size, cache_version):
     """Load + featurize a reference track ONCE and cache it across all sessions.
     Returns (duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref).
 
-    file_mtime is part of the cache key so trimmed/replaced .wav files invalidate stale
-    entries (without this, pacing still referenced the old ~30s song 18 after trimming).
-
-    Scoring uses MFCC (pronunciation) only; chroma + pitch are returned for coaching."""
+    file_mtime + file_size + cache_version are part of the cache key so trimmed or
+    replaced .wav files invalidate stale entries on deploy."""
     y_ref, sr_ref = librosa.load(ref_path, sr=22050)
     duration_ref = librosa.get_duration(y=y_ref, sr=sr_ref)
     hop_len = 512 if duration_ref <= 90 else 2048
@@ -156,6 +164,22 @@ def _reference_features(ref_path, file_mtime):
         f0_ref = (f0_ref - np.mean(f0_ref)) / (np.std(f0_ref) + 1e-6)
     f0_ref = f0_ref.reshape(1, -1)
     mfcc_ref = (mfcc_ref - np.mean(mfcc_ref)) / (np.std(mfcc_ref) + 1e-6)
+    return duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref
+
+
+def _load_reference(path):
+    """Load cached reference features; pacing uses live file duration (matches top UI).
+
+    If a stale cache entry slips through (cached duration != file duration), clear
+    the cache once and reload."""
+    mtime, fsize = _ref_file_key(path)
+    cached_dur, hop_len, mfcc_ref, chroma_ref, f0_ref = _reference_features(
+        path, mtime, fsize, SONGS_CACHE_VERSION)
+    duration_ref = librosa.get_duration(path=path)
+    if abs(cached_dur - duration_ref) > 0.5:
+        _reference_features.clear()
+        _, hop_len, mfcc_ref, chroma_ref, f0_ref = _reference_features(
+            path, mtime, fsize, SONGS_CACHE_VERSION)
     return duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref
 
 
@@ -210,20 +234,22 @@ def _tempo_feedback(duration_ref, duration_user, time_ratio):
     if time_ratio >= 0.85:
         return "good", (
             f"Pacing matches the reference well "
-            f"({duration_user:.0f}s sung vs {duration_ref:.0f}s target)."
+            f"({int(round(duration_user))}s sung vs {int(round(duration_ref))}s target)."
         )
     if duration_user > duration_ref * 1.05:
         return "slow", (
             f"You sang **slower** than the reference — about {abs(delta_pct):.0f}% longer "
-            f"({duration_user:.0f}s vs {duration_ref:.0f}s). Try keeping a steadier pace."
+            f"({int(round(duration_user))}s vs {int(round(duration_ref))}s). "
+            f"Try keeping a steadier pace."
         )
     if duration_user < duration_ref * 0.95:
         return "fast", (
             f"You sang **faster** than the reference — about {abs(delta_pct):.0f}% shorter "
-            f"({duration_user:.0f}s vs {duration_ref:.0f}s). Slow down to match the reference."
+            f"({int(round(duration_user))}s vs {int(round(duration_ref))}s). "
+            f"Slow down to match the reference."
         )
     return "ok", (
-        f"Pacing is close ({duration_user:.0f}s vs {duration_ref:.0f}s), "
+        f"Pacing is close ({int(round(duration_user))}s vs {int(round(duration_ref))}s), "
         f"but tightening rhythm may help your score."
     )
 
@@ -773,9 +799,8 @@ if user_id and selected_song_path:
         attempt_no = attempt_counts[song_key]
 
         with st.spinner("Analyzing your pronunciation, timing, and tune..."):
-            ref_mtime = os.path.getmtime(selected_song_path)
-            duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref = _reference_features(
-                selected_song_path, ref_mtime)
+            duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref = _load_reference(
+                selected_song_path)
 
             try:
                 y_user, sr_user = librosa.load(io.BytesIO(audio_bytes), sr=22050)
