@@ -885,10 +885,9 @@ if user_id and selected_song_path:
             norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100.0
 
             # --- Wrong-poem check: which padyam did they ACTUALLY sing? ---
-            wrong_song, best_match = False, None
-            uncapped_score = None
+            wrong_song = False
             if not is_final_test:
-                wrong_song, best_match, _, _ = _detect_wrong_song(
+                wrong_song, _, _, _ = _detect_wrong_song(
                     song_key, chroma_user, mfcc_user_norm, available_songs)
 
             # --- 5. FINAL SCORE: articulation (word clarity) + pacing to SELECTED ref ---
@@ -912,7 +911,6 @@ if user_id and selected_song_path:
             else:
                 score = round(float(final_score), 2)
 
-            uncapped_score = score
             if wrong_song:
                 score = min(score, 35.0)
                 st.session_state[f"_last_wrong_{song_key}"] = True
@@ -934,11 +932,10 @@ if user_id and selected_song_path:
                        f"Analyzed against: **{display_name}**")
             if wrong_song:
                 st.error(
-                    f"**Wrong padyam detected** — this sounds like **{best_match}**, "
-                    f"not **{display_name}**. "
-                    f"Tune/pacing to the selected reference was {uncapped_score}%, but "
-                    f"**you must sing the selected padyam's lyrics** to qualify. "
-                    f"Tap **Discard & record again**."
+                    f"**Wrong padyam detected** — this recording does not match "
+                    f"**{display_name}**. "
+                    f"Please sing the **selected** padyam's lyrics and tap "
+                    f"**Discard & record again**."
                 )
 
             st.subheader("How you did")
