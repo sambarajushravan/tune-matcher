@@ -728,17 +728,33 @@ if user_id and selected_song_path:
             font-weight: 700 !important;
             color: #b00020 !important;
         }
+        /* Make the native record/stop button clearly red */
+        div[data-testid="stAudioInput"] button {
+            background-color: #e63946 !important;
+            border: 2px solid #c1121f !important;
+            color: #ffffff !important;
+        }
+        div[data-testid="stAudioInput"] button:hover {
+            background-color: #c1121f !important;
+            border-color: #9d0208 !important;
+        }
+        div[data-testid="stAudioInput"] button svg {
+            fill: #ffffff !important;
+            stroke: #ffffff !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
     with st.container(border=True):
-        st.markdown("### 🎤 Step 2 — Record your singing")
+        st.markdown("### Step 2 — Record your singing")
         st.markdown(
-            "**Tap the red microphone below**, sing the **whole padyam with clear words**, "
-            "then tap **stop**. Nothing is analyzed until you press **Analyze**."
+            "In the **red box below**, tap the **microphone button** to start, "
+            "sing the **whole padyam with clear words**, then tap **stop**. "
+            "Nothing is analyzed until you press **Analyze**."
         )
-        audio_value = st.audio_input("🎙️ Tap here to start recording", key=f"recorder_{song_key}")
+        audio_value = st.audio_input("Tap the microphone button to start recording",
+                                     key=f"recorder_{song_key}")
 
     # Explicit confirm step: nothing is analyzed until they press Analyze, so they can
     # re-record if they stopped too early ("cancel before analysis").
