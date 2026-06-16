@@ -92,10 +92,9 @@ MIN_ARTICULATION_RATIO = 0.68  # user syllable variation vs reference (hums are 
 
 # MFCC rows used for pass/fail (skip c0–c3: energy/broad spectrum — humming matches these).
 _ARTICULATION_ROWS = slice(4, 13)
-# Selected poem must beat every other poem by at least this identity distance margin.
-_WRONG_SONG_MARGIN = 0.06
-# Other poem must be at least this fraction better than selected (8% closer match).
-_WRONG_SONG_REL_RATIO = 0.92
+# Other poem must be clearly closer than selected (absolute + relative margin).
+_WRONG_SONG_MARGIN = 0.03
+_WRONG_SONG_REL_RATIO = 0.97
 
 
 def _dtw_norm_dist(X, Y):
@@ -112,8 +111,11 @@ def _dtw_norm_dist(X, Y):
 
 
 def _song_identity_matrix(chroma, mfcc):
-    """Chroma + articulation MFCC — discriminates WHICH padyam was sung."""
-    return np.vstack([chroma, _articulation_mfcc(mfcc) * 1.2])
+    """Chroma + full MFCC — discriminates WHICH padyam (lyrics/tune content).
+
+    Chroma is weighted higher because different padyams follow different note patterns;
+    full MFCC (not just articulation) captures lyric shape, not just vowel timbre."""
+    return np.vstack([chroma * 2.0, mfcc])
 
 
 def _detect_wrong_song(song_key, chroma_user, mfcc_user_norm, available_songs):
@@ -882,17 +884,16 @@ if user_id and selected_song_path:
             path_length = len(wp)
             norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100.0
 
-            # --- Wrong-poem check (after we know how well they match the SELECTED ref) ---
+            # --- Wrong-poem check: which padyam did they ACTUALLY sing? ---
             wrong_song, best_match = False, None
+            uncapped_score = None
             if not is_final_test:
                 wrong_song, best_match, _, _ = _detect_wrong_song(
                     song_key, chroma_user, mfcc_user_norm, available_songs)
-                # Strong direct match to the selected reference overrides identity scan
-                # (prevents false "wrong poem" after a good take or with phone-mic noise).
-                if wrong_song and norm_dist <= GOOD_MATCH_DIST * 1.2:
-                    wrong_song, best_match = False, None
 
-            # --- 5. FINAL SCORE: articulation (word clarity) + pacing ---
+            # --- 5. FINAL SCORE: articulation (word clarity) + pacing to SELECTED ref ---
+            # Note: this score alone does NOT prove the correct padyam — similar tunes can
+            # score high against the wrong reference. wrong_song (above) enforces lyrics.
             if norm_dist <= GOOD_MATCH_DIST:
                 base_score = 100.0 - ((norm_dist / GOOD_MATCH_DIST) * 5.0)
             else:
@@ -911,6 +912,7 @@ if user_id and selected_song_path:
             else:
                 score = round(float(final_score), 2)
 
+            uncapped_score = score
             if wrong_song:
                 score = min(score, 35.0)
                 st.session_state[f"_last_wrong_{song_key}"] = True
@@ -932,14 +934,20 @@ if user_id and selected_song_path:
                        f"Analyzed against: **{display_name}**")
             if wrong_song:
                 st.error(
-                    f"This recording sounds like **{best_match}**, not **{display_name}**. "
-                    f"Tap **Discard & record again**, then sing the **selected** padyam."
+                    f"**Wrong padyam detected** — this sounds like **{best_match}**, "
+                    f"not **{display_name}**. "
+                    f"Tune/pacing to the selected reference was {uncapped_score}%, but "
+                    f"**you must sing the selected padyam's lyrics** to qualify. "
+                    f"Tap **Discard & record again**."
                 )
 
             st.subheader("How you did")
-            st.caption("Overall score is based on **pronunciation (clear words)** and **pacing**. "
-                       "You must sing the words — humming won't qualify. "
-                       "Musical notes and melody bars are guidance only.")
+            st.caption(
+                "Pass requires: **(1) correct padyam** (lyrics/content), "
+                "**(2) clear pronunciation**, **(3) good pacing**. "
+                "The score above measures pronunciation + pacing against the **selected** "
+                "reference only — a different padyam can still score high if the tune is similar."
+            )
             col1, col2 = st.columns(2)
             with col1:
                 st.progress(int(feedback["pronunciation_pct"]) / 100.0,
