@@ -9,11 +9,81 @@ import re
 import hashlib
 import datetime
 import pandas as pd
+import time
+import threading
+import uuid
 
 # --- APP CONFIG ---
 st.set_page_config(page_title="Sataka Sankharavam Tune Matcher", page_icon="🎤")
 st.title("🎤 Sataka Sankharavam Tune Matcher Challenge")
 st.write("Match the tune and timing at 85% or higher to pass!")
+
+# --- SERVER-SIDE SESSION TRACKING (single Streamlit process; best-effort on Community Cloud) ---
+# Counts browser sessions active within ACTIVE_SESSION_WINDOW_SEC. When congested, Analyze
+# is blocked so heavy librosa work doesn't pile up on the shared container.
+MAX_CONCURRENT_SESSIONS = 40
+INACTIVITY_LOGOUT_SEC = 600       # 10 minutes without interaction → auto log out
+ACTIVE_SESSION_WINDOW_SEC = 300   # sessions seen in last 5 min count as "online now"
+
+_active_lock = threading.Lock()
+_active_sessions = {}  # session_id -> last_seen unix timestamp
+
+
+def _session_id():
+    if "_sid" not in st.session_state:
+        st.session_state._sid = str(uuid.uuid4())
+    return st.session_state._sid
+
+
+def _prune_active_sessions(cutoff):
+    stale = [k for k, t in _active_sessions.items() if t < cutoff]
+    for k in stale:
+        del _active_sessions[k]
+
+
+def _touch_active_session():
+    sid = _session_id()
+    now = time.time()
+    with _active_lock:
+        _active_sessions[sid] = now
+        _prune_active_sessions(now - INACTIVITY_LOGOUT_SEC)
+
+
+def _unregister_active_session():
+    sid = st.session_state.get("_sid")
+    if not sid:
+        return
+    with _active_lock:
+        _active_sessions.pop(sid, None)
+
+
+def _active_session_count():
+    now = time.time()
+    cutoff = now - ACTIVE_SESSION_WINDOW_SEC
+    with _active_lock:
+        return sum(1 for t in _active_sessions.values() if t >= cutoff)
+
+
+def _server_congested():
+    return _active_session_count() >= MAX_CONCURRENT_SESSIONS
+
+
+def _logout_user():
+    """Clear participant session state and drop this browser from the active registry."""
+    _unregister_active_session()
+    st.session_state.authenticated = False
+    st.session_state.user_id = None
+    st.session_state.registration_id = None
+    st.session_state.attempt_counts = {}
+    for key in list(st.session_state.keys()):
+        if (key.startswith("_audio_hash_") or key.startswith("_last_wrong_")
+                or key in ("_active_song", "_rec_nonce")):
+            st.session_state.pop(key, None)
+    st.session_state.pop("completed_songs", None)
+    st.session_state.pop("final_done", None)
+    st.session_state.pop("final_score", None)
+    st.session_state.pop("_last_activity", None)
+    st.session_state.pop("_sid", None)
 
 
 # --- GOOGLE SHEETS BACKEND (gspread, lightweight reads/writes) ---
@@ -93,8 +163,10 @@ MIN_ARTICULATION_RATIO = 0.68  # user syllable variation vs reference (hums are 
 # MFCC rows used for pass/fail (skip c0–c3: energy/broad spectrum — humming matches these).
 _ARTICULATION_ROWS = slice(4, 13)
 # Other poem must be clearly closer than selected (absolute + relative margin).
-_WRONG_SONG_MARGIN = 0.03
-_WRONG_SONG_REL_RATIO = 0.97
+_WRONG_SONG_MARGIN = 0.05
+_WRONG_SONG_REL_RATIO = 0.94
+# If identity distances tie within this epsilon, trust the dropdown selection.
+_IDENTITY_TIE_EPS = 0.025
 
 
 def _dtw_norm_dist(X, Y):
@@ -134,11 +206,12 @@ def _detect_wrong_song(song_key, chroma_user, mfcc_user_norm, available_songs):
     selected_dist = dists[song_key]
     best_name = min(dists, key=dists.get)
     best_dist = dists[best_name]
-    if (best_name != song_key
-            and best_dist < selected_dist * _WRONG_SONG_REL_RATIO
-            and best_dist + _WRONG_SONG_MARGIN < selected_dist):
-        return True, best_name, selected_dist, best_dist
-    return False, None, selected_dist, best_dist
+    wrong = False
+    if best_name != song_key and abs(selected_dist - best_dist) > _IDENTITY_TIE_EPS:
+        if (best_dist < selected_dist * _WRONG_SONG_REL_RATIO
+                and best_dist + _WRONG_SONG_MARGIN < selected_dist):
+            wrong = True
+    return wrong, best_name, selected_dist, best_dist
 
 
 # Bump when reference .wav files change (trim/replace) to bust stale Streamlit caches.
@@ -529,6 +602,9 @@ if not st.session_state.authenticated:
                 st.session_state.pop("completed_songs", None)
                 st.session_state.pop("final_done", None)
                 st.session_state.pop("final_score", None)
+                st.session_state._sid = str(uuid.uuid4())
+                st.session_state._last_activity = time.time()
+                _touch_active_session()
                 st.rerun()
             else:
                 st.error("Name or Registration ID is incorrect. Please check and try again.")
@@ -565,9 +641,10 @@ with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
                     total_passes = len(passes_df)
                     unique_singers = passes_df["User ID"].nunique()
 
-                    col1, col2 = st.columns(2)
+                    col1, col2, col3 = st.columns(3)
                     col1.metric("Total Qualifications Logged", total_passes)
                     col2.metric("Total Unique Active Users", unique_singers)
+                    col3.metric("Browsers Active Now (≈5 min)", _active_session_count())
 
                     st.subheader("🏆 Top Participant Progress")
                     leaderboard = passes_df["User ID"].value_counts().reset_index()
@@ -615,24 +692,42 @@ with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
         else:
             st.error("Incorrect Password.")
 
+# Inactivity timeout + heartbeat (before participant UI).
+if st.session_state.authenticated:
+    last = st.session_state.get("_last_activity")
+    if last and time.time() - last > INACTIVITY_LOGOUT_SEC:
+        _logout_user()
+        st.warning(
+            "You were logged out after **10 minutes** of inactivity. "
+            "Please log in again. (Use **Log out** when switching to another family member.)"
+        )
+        st.rerun()
+    st.session_state._last_activity = time.time()
+    _touch_active_session()
+
 # Stop here until the participant logs in (admin panel above still renders).
 if not st.session_state.authenticated:
     st.stop()
 
 # --- AUTHENTICATED PARTICIPANT FLOW ---
 user_id = st.session_state.user_id
+_active_now = _active_session_count()
 
 header_col, logout_col = st.columns([3, 1])
 header_col.success(f"Logged in as: {user_id}")
 if logout_col.button("Log out"):
-    st.session_state.authenticated = False
-    st.session_state.user_id = None
-    st.session_state.registration_id = None
-    st.session_state.attempt_counts = {}
-    st.session_state.pop("completed_songs", None)
-    st.session_state.pop("final_done", None)
-    st.session_state.pop("final_score", None)
+    _logout_user()
     st.rerun()
+
+if _server_congested():
+    st.warning(
+        f"**High traffic right now** — about **{_active_now}** people are using the app. "
+        f"Please **wait a few minutes** before pressing **Analyze**. "
+        f"You can still listen to the reference and record your take. "
+        f"This keeps scoring fast and reliable for everyone."
+    )
+else:
+    st.caption(f"Active now: ~{_active_now} participant(s) (last few minutes).")
 
 # --- DYNAMIC SONG LOADING ---
 SONG_DIR = "songs"
@@ -810,6 +905,14 @@ if user_id and selected_song_path:
                    "if you sang the wrong padyam or want a fresh take.")
 
     if do_analyze:
+        _touch_active_session()
+        if _server_congested():
+            st.warning(
+                f"**Too many people analyzing at once** (~{_active_session_count()} active). "
+                f"Please wait **2–5 minutes** and try **Analyze** again. "
+                f"Your recording is still here — no need to re-record."
+            )
+            st.stop()
         audio_bytes = audio_value.getvalue()
         audio_hash = hashlib.md5(audio_bytes).hexdigest()
         hash_key = f"_audio_hash_{song_key}"
@@ -886,9 +989,16 @@ if user_id and selected_song_path:
 
             # --- Wrong-poem check: which padyam did they ACTUALLY sing? ---
             wrong_song = False
+            identity_best = None
+            identity_sel_d = identity_best_d = None
             if not is_final_test:
-                wrong_song, _, _, _ = _detect_wrong_song(
+                wrong_song, identity_best, identity_sel_d, identity_best_d = _detect_wrong_song(
                     song_key, chroma_user, mfcc_user_norm, available_songs)
+            identity_blocks_pass = (
+                not is_final_test
+                and identity_best != song_key
+                and identity_best_d + _IDENTITY_TIE_EPS < identity_sel_d
+            )
 
             # --- 5. FINAL SCORE: articulation (word clarity) + pacing to SELECTED ref ---
             # Note: this score alone does NOT prove the correct padyam — similar tunes can
@@ -917,6 +1027,9 @@ if user_id and selected_song_path:
             else:
                 st.session_state.pop(f"_last_wrong_{song_key}", None)
 
+            if identity_blocks_pass and not wrong_song:
+                score = min(score, 35.0)
+
             pron_d = _path_layer_distance(mfcc_ref_art, mfcc_user_art, wp, slice(0, 9))
             pron_pct = _layer_to_pct(pron_d, *_LAYER_ANCHORS["pronunciation"])
             clear_words = (pron_pct >= MIN_PRONUNCIATION_PCT
@@ -931,6 +1044,13 @@ if user_id and selected_song_path:
             st.caption(f"🎙️ Attempt #{attempt_no} for this song (this session). "
                        f"Analyzed against: **{display_name}**")
             if wrong_song:
+                st.error(
+                    f"**Wrong padyam detected** — this recording does not match "
+                    f"**{display_name}**. "
+                    f"Please sing the **selected** padyam's lyrics and tap "
+                    f"**Discard & record again**."
+                )
+            elif identity_blocks_pass:
                 st.error(
                     f"**Wrong padyam detected** — this recording does not match "
                     f"**{display_name}**. "
@@ -963,21 +1083,28 @@ if user_id and selected_song_path:
                 st.markdown(f"- {tip}")
 
             with st.expander("Technical details (for organizers)"):
+                id_line = ""
+                if identity_sel_d is not None:
+                    id_line = (
+                        f" | Identity: selected={round(identity_sel_d, 3)}"
+                        f", best={round(identity_best_d, 3)} ({identity_best})"
+                    )
                 st.caption(
                     f"Raw Dist (articulation MFCC): {round(norm_dist, 2)} | "
                     f"Tempo Acc: {round(time_ratio * 100, 1)}% | "
                     f"Articulation ratio: {round(articulation_ratio, 2)} | "
                     f"Base score: {round(base_score, 1)} | Tempo blend: {round(tempo_blend, 2)} | "
-                    f"Ref length: {duration_ref:.1f}s"
+                    f"Ref length: {duration_ref:.1f}s{id_line}"
                 )
 
             # Rough timbre fingerprint of this recording (used only if they qualify)
             voice_sig = _voice_signature(mfcc_user)
 
         # --- GOOGLE SHEETS UPSERT LOGIC ---
-        qualified = (score >= 85 and clear_words and not wrong_song)
+        qualified = (score >= 85 and clear_words and not wrong_song
+                     and not identity_blocks_pass)
 
-        if wrong_song:
+        if wrong_song or identity_blocks_pass:
             pass  # error already shown above; score capped — cannot qualify
         elif score >= 85 and not clear_words:
             st.warning(
