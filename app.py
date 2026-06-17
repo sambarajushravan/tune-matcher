@@ -10,8 +10,9 @@ import hashlib
 import datetime
 import pandas as pd
 import time
-import threading
 import uuid
+
+import tune_core as tc
 
 # --- APP CONFIG ---
 st.set_page_config(page_title="Sataka Sankharavam Tune Matcher", page_icon="🎤")
@@ -21,11 +22,10 @@ st.write("Match the tune and timing at 85% or higher to pass!")
 # --- SERVER-SIDE SESSION TRACKING (single Streamlit process; best-effort on Community Cloud) ---
 # Counts browser sessions active within ACTIVE_SESSION_WINDOW_SEC. When congested, Analyze
 # is blocked so heavy librosa work doesn't pile up on the shared container.
-MAX_CONCURRENT_SESSIONS = 40
-INACTIVITY_LOGOUT_SEC = 600       # 10 minutes without interaction → auto log out
-ACTIVE_SESSION_WINDOW_SEC = 300   # sessions seen in last 5 min count as "online now"
+MAX_CONCURRENT_SESSIONS = tc.MAX_CONCURRENT_SESSIONS
+INACTIVITY_LOGOUT_SEC = tc.INACTIVITY_LOGOUT_SEC
+ACTIVE_SESSION_WINDOW_SEC = tc.ACTIVE_SESSION_WINDOW_SEC
 
-_active_lock = threading.Lock()
 _active_sessions = {}  # session_id -> last_seen unix timestamp
 
 
@@ -35,37 +35,22 @@ def _session_id():
     return st.session_state._sid
 
 
-def _prune_active_sessions(cutoff):
-    stale = [k for k, t in _active_sessions.items() if t < cutoff]
-    for k in stale:
-        del _active_sessions[k]
-
-
 def _touch_active_session():
-    sid = _session_id()
-    now = time.time()
-    with _active_lock:
-        _active_sessions[sid] = now
-        _prune_active_sessions(now - INACTIVITY_LOGOUT_SEC)
+    tc.touch_active_session(_active_sessions, _session_id(), time.time())
 
 
 def _unregister_active_session():
     sid = st.session_state.get("_sid")
-    if not sid:
-        return
-    with _active_lock:
+    if sid:
         _active_sessions.pop(sid, None)
 
 
 def _active_session_count():
-    now = time.time()
-    cutoff = now - ACTIVE_SESSION_WINDOW_SEC
-    with _active_lock:
-        return sum(1 for t in _active_sessions.values() if t >= cutoff)
+    return tc.active_session_count(_active_sessions, time.time())
 
 
 def _server_congested():
-    return _active_session_count() >= MAX_CONCURRENT_SESSIONS
+    return tc.server_congested(_active_sessions, time.time())
 
 
 def _logout_user():
@@ -153,102 +138,56 @@ def _final_test_enabled():
     return bool(val)
 
 
-# Scoring prioritizes pronunciation (articulation MFCC) + pacing.
-TEMPO_OK_SEC = 2.0          # within ±2s of reference → full pacing credit
-TEMPO_MAX_SEC = 3.0          # beyond ±3s → minimum pacing credit (linear ramp between)
-TEMPO_WEIGHT = 0.40
-# Final Test (~6 min): scale pacing windows proportionally to reference length.
-FINAL_TEST_TEMPO_OK_RATIO = 0.008
-FINAL_TEST_TEMPO_MAX_RATIO = 0.012
-GOOD_MATCH_DIST = 1.30       # articulation MFCC anchor (coeffs 4–12)
-PENALTY_SLOPE = 85.0
-MIN_PRONUNCIATION_PCT = 88     # must sing words clearly — humming/mumbling blocked
-MIN_ARTICULATION_RATIO = 0.68  # user syllable variation vs reference (hums are too flat)
-
-# MFCC rows used for pass/fail (skip c0–c3: energy/broad spectrum — humming matches these).
-_ARTICULATION_ROWS = slice(4, 13)
-# Other poem must be clearly closer than selected (absolute + relative margin).
-_WRONG_SONG_MARGIN = 0.05
-_WRONG_SONG_REL_RATIO = 0.94
-# If identity distances tie within this epsilon, trust the dropdown selection.
-_IDENTITY_TIE_EPS = 0.025
+# Scoring constants (see tune_core.py — tested by tests/test_harness.py)
+TEMPO_OK_SEC = tc.TEMPO_OK_SEC
+TEMPO_MAX_SEC = tc.TEMPO_MAX_SEC
+TEMPO_WEIGHT = tc.TEMPO_WEIGHT
+GOOD_MATCH_DIST = tc.GOOD_MATCH_DIST
+PENALTY_SLOPE = tc.PENALTY_SLOPE
+MIN_PRONUNCIATION_PCT = tc.MIN_PRONUNCIATION_PCT
+MIN_ARTICULATION_RATIO = tc.MIN_ARTICULATION_RATIO
+_ARTICULATION_ROWS = tc.ARTICULATION_ROWS
+_IDENTITY_TIE_EPS = tc.IDENTITY_TIE_EPS
+SONGS_CACHE_VERSION = tc.SONGS_CACHE_VERSION
 
 
 def _dtw_norm_dist(X, Y):
-    """Band-constrained DTW distance normalized by path length."""
-    try:
-        D, wp = librosa.sequence.dtw(
-            X, Y, metric='euclidean', backtrack=True,
-            global_constraints=True, band_rad=0.1,
-        )
-    except Exception:
-        D, wp = librosa.sequence.dtw(X, Y, metric='euclidean', backtrack=True)
-    pl = len(wp)
-    return float(D[-1, -1] / pl) if pl > 0 else 100.0
+    return tc.dtw_norm_dist(X, Y)
 
 
 def _song_identity_matrix(chroma, mfcc):
-    """Chroma + full MFCC — discriminates WHICH padyam (lyrics/tune content).
-
-    Chroma is weighted higher because different padyams follow different note patterns;
-    full MFCC (not just articulation) captures lyric shape, not just vowel timbre."""
-    return np.vstack([chroma * 2.0, mfcc])
+    return tc.song_identity_matrix(chroma, mfcc)
 
 
 def _detect_wrong_song(song_key, chroma_user, mfcc_user_norm, available_songs):
-    """Return (is_wrong, best_match_name, selected_dist, best_dist).
-
-    Compares the recording against every reference. Flags wrong poem only when
-    another padyam is a clearly better match than the dropdown selection."""
-    ident_user = _song_identity_matrix(chroma_user, mfcc_user_norm)
-    dists = {}
-    for name, path in available_songs.items():
+    def _ref_loader(path):
         mtime, fsize = _ref_file_key(path)
         _, _, mfcc_r, chroma_r, _ = _reference_features(
             path, mtime, fsize, SONGS_CACHE_VERSION)
-        dists[name] = _dtw_norm_dist(_song_identity_matrix(chroma_r, mfcc_r), ident_user)
-
-    selected_dist = dists[song_key]
-    best_name = min(dists, key=dists.get)
-    best_dist = dists[best_name]
-    wrong = False
-    if best_name != song_key and abs(selected_dist - best_dist) > _IDENTITY_TIE_EPS:
-        if (best_dist < selected_dist * _WRONG_SONG_REL_RATIO
-                and best_dist + _WRONG_SONG_MARGIN < selected_dist):
-            wrong = True
-    return wrong, best_name, selected_dist, best_dist
-
-
-# Bump when reference .wav files change (trim/replace) to bust stale Streamlit caches.
-SONGS_CACHE_VERSION = 2
+        return mfcc_r, chroma_r
+    return tc.detect_wrong_song(
+        song_key, chroma_user, mfcc_user_norm, available_songs, _ref_loader)
 
 
 def _ref_file_key(path):
-    """Cache-bust key from file identity (mtime + size)."""
-    return os.path.getmtime(path), os.path.getsize(path)
+    return tc.ref_file_key(path)
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
 def _reference_features(ref_path, file_mtime, file_size, cache_version):
-    """Load + featurize a reference track ONCE and cache it across all sessions.
-    Returns (duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref).
+    return tc.extract_reference_features(ref_path)
 
-    file_mtime + file_size + cache_version are part of the cache key so trimmed or
-    replaced .wav files invalidate stale entries on deploy."""
-    y_ref, sr_ref = librosa.load(ref_path, sr=22050)
-    duration_ref = librosa.get_duration(y=y_ref, sr=sr_ref)
-    hop_len = 512 if duration_ref <= 90 else 2048
 
-    mfcc_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13, hop_length=hop_len)
-    chroma_ref = librosa.feature.chroma_stft(y=y_ref, sr=sr_ref, hop_length=hop_len)
-    f0_ref, _, _ = librosa.pyin(y_ref, fmin=librosa.note_to_hz('C2'),
-                                fmax=librosa.note_to_hz('C7'), sr=sr_ref, hop_length=hop_len)
-    f0_ref = np.nan_to_num(f0_ref)
-    if np.std(f0_ref) > 0:
-        f0_ref = (f0_ref - np.mean(f0_ref)) / (np.std(f0_ref) + 1e-6)
-    f0_ref = f0_ref.reshape(1, -1)
-    mfcc_ref = (mfcc_ref - np.mean(mfcc_ref)) / (np.std(mfcc_ref) + 1e-6)
-    return duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref
+def _articulation_mfcc(mfcc):
+    return tc.articulation_mfcc(mfcc)
+
+
+def _tempo_limits(duration_ref, is_final_test):
+    return tc.tempo_limits(duration_ref, is_final_test)
+
+
+def _tempo_factor(duration_ref, duration_user, is_final_test):
+    return tc.tempo_factor(duration_ref, duration_user, is_final_test)
 
 
 def _load_reference(path):
@@ -265,11 +204,6 @@ def _load_reference(path):
         _, hop_len, mfcc_ref, chroma_ref, f0_ref = _reference_features(
             path, mtime, fsize, SONGS_CACHE_VERSION)
     return duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref
-
-
-def _articulation_mfcc(mfcc):
-    """Higher MFCC coefficients — sensitive to consonants/vowels; humming lacks these."""
-    return mfcc[_ARTICULATION_ROWS]
 
 
 def _articulation_ratio(mfcc_ref, mfcc_user):
@@ -308,27 +242,6 @@ def _layer_to_pct(dist, good, bad):
         return round(100.0 - (dist / good) * 8.0, 0)
     span = max(bad - good, 1e-6)
     return round(max(0.0, 92.0 - ((dist - good) / span) * 55.0), 0)
-
-
-def _tempo_limits(duration_ref, is_final_test):
-    """Return (ok_sec, max_sec) pacing windows for this reference."""
-    if is_final_test:
-        ok = max(TEMPO_OK_SEC, duration_ref * FINAL_TEST_TEMPO_OK_RATIO)
-        mx = max(TEMPO_MAX_SEC, duration_ref * FINAL_TEST_TEMPO_MAX_RATIO)
-        return ok, max(mx, ok + 0.5)
-    return TEMPO_OK_SEC, TEMPO_MAX_SEC
-
-
-def _tempo_factor(duration_ref, duration_user, is_final_test):
-    """Pacing multiplier 0..1 from absolute seconds off reference length."""
-    ok_sec, max_sec = _tempo_limits(duration_ref, is_final_test)
-    delta = abs(duration_user - duration_ref)
-    if delta <= ok_sec:
-        return 1.0, delta, ok_sec, max_sec
-    if delta >= max_sec:
-        return 0.0, delta, ok_sec, max_sec
-    t = (delta - ok_sec) / (max_sec - ok_sec)
-    return max(0.0, 1.0 - t), delta, ok_sec, max_sec
 
 
 def _tempo_feedback(duration_ref, duration_user, delta_sec, ok_sec, max_sec):
@@ -1059,11 +972,9 @@ if user_id and selected_song_path:
             if not is_final_test:
                 wrong_song, identity_best, identity_sel_d, identity_best_d = _detect_wrong_song(
                     song_key, chroma_user, mfcc_user_norm, available_songs)
-            identity_blocks_pass = (
-                not is_final_test
-                and identity_best != song_key
-                and identity_best_d + _IDENTITY_TIE_EPS < identity_sel_d
-            )
+            identity_blocks_pass = tc.identity_blocks_pass(
+                song_key, identity_best, identity_sel_d, identity_best_d,
+                is_final_test=is_final_test)
 
             # --- 5. FINAL SCORE: articulation (word clarity) + pacing to SELECTED ref ---
             # Note: this score alone does NOT prove the correct padyam — similar tunes can
