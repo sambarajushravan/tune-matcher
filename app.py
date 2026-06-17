@@ -82,6 +82,7 @@ def _logout_user():
     st.session_state.pop("completed_songs", None)
     st.session_state.pop("final_done", None)
     st.session_state.pop("final_score", None)
+    st.session_state.pop("last_feedback", None)
     st.session_state.pop("_last_activity", None)
     st.session_state.pop("_sid", None)
 
@@ -153,8 +154,12 @@ def _final_test_enabled():
 
 
 # Scoring prioritizes pronunciation (articulation MFCC) + pacing.
-TEMPO_TOLERANCE = 0.90
+TEMPO_OK_SEC = 2.0          # within ±2s of reference → full pacing credit
+TEMPO_MAX_SEC = 3.0          # beyond ±3s → minimum pacing credit (linear ramp between)
 TEMPO_WEIGHT = 0.40
+# Final Test (~6 min): scale pacing windows proportionally to reference length.
+FINAL_TEST_TEMPO_OK_RATIO = 0.008
+FINAL_TEST_TEMPO_MAX_RATIO = 0.012
 GOOD_MATCH_DIST = 1.30       # articulation MFCC anchor (coeffs 4–12)
 PENALTY_SLOPE = 85.0
 MIN_PRONUNCIATION_PCT = 88     # must sing words clearly — humming/mumbling blocked
@@ -305,31 +310,49 @@ def _layer_to_pct(dist, good, bad):
     return round(max(0.0, 92.0 - ((dist - good) / span) * 55.0), 0)
 
 
-def _tempo_feedback(duration_ref, duration_user, time_ratio):
+def _tempo_limits(duration_ref, is_final_test):
+    """Return (ok_sec, max_sec) pacing windows for this reference."""
+    if is_final_test:
+        ok = max(TEMPO_OK_SEC, duration_ref * FINAL_TEST_TEMPO_OK_RATIO)
+        mx = max(TEMPO_MAX_SEC, duration_ref * FINAL_TEST_TEMPO_MAX_RATIO)
+        return ok, max(mx, ok + 0.5)
+    return TEMPO_OK_SEC, TEMPO_MAX_SEC
+
+
+def _tempo_factor(duration_ref, duration_user, is_final_test):
+    """Pacing multiplier 0..1 from absolute seconds off reference length."""
+    ok_sec, max_sec = _tempo_limits(duration_ref, is_final_test)
+    delta = abs(duration_user - duration_ref)
+    if delta <= ok_sec:
+        return 1.0, delta, ok_sec, max_sec
+    if delta >= max_sec:
+        return 0.0, delta, ok_sec, max_sec
+    t = (delta - ok_sec) / (max_sec - ok_sec)
+    return max(0.0, 1.0 - t), delta, ok_sec, max_sec
+
+
+def _tempo_feedback(duration_ref, duration_user, delta_sec, ok_sec, max_sec):
     """Return (status, user_message) for pacing."""
     if duration_ref <= 0:
         return "good", "Pacing matches the reference."
-    delta_pct = (duration_user - duration_ref) / duration_ref * 100.0
-    if time_ratio >= 0.85:
+    ref_i, user_i = int(round(duration_ref)), int(round(duration_user))
+    if delta_sec <= ok_sec:
         return "good", (
             f"Pacing matches the reference well "
-            f"({int(round(duration_user))}s sung vs {int(round(duration_ref))}s target)."
+            f"({user_i}s sung vs {ref_i}s target, within {ok_sec:.0f}s)."
         )
-    if duration_user > duration_ref * 1.05:
-        return "slow", (
-            f"You sang **slower** than the reference — about {abs(delta_pct):.0f}% longer "
-            f"({int(round(duration_user))}s vs {int(round(duration_ref))}s). "
-            f"Try keeping a steadier pace."
+    if delta_sec >= max_sec:
+        direction = "slower" if duration_user > duration_ref else "faster"
+        return "bad", (
+            f"You sang **{direction}** than the reference by **{delta_sec:.1f}s** "
+            f"({user_i}s vs {ref_i}s target). Aim for within **±{ok_sec:.0f}s** — "
+            f"this lowered your score."
         )
-    if duration_user < duration_ref * 0.95:
-        return "fast", (
-            f"You sang **faster** than the reference — about {abs(delta_pct):.0f}% shorter "
-            f"({int(round(duration_user))}s vs {int(round(duration_ref))}s). "
-            f"Slow down to match the reference."
-        )
+    direction = "slower" if duration_user > duration_ref else "faster"
     return "ok", (
-        f"Pacing is close ({int(round(duration_user))}s vs {int(round(duration_ref))}s), "
-        f"but tightening rhythm may help your score."
+        f"You sang slightly **{direction}** — **{delta_sec:.1f}s** off "
+        f"({user_i}s vs {ref_i}s target). Within **±{ok_sec:.0f}s** is ideal; "
+        f"over **±{max_sec:.0f}s** reduces your score more."
     )
 
 
@@ -342,8 +365,8 @@ def _coaching_tips(pron_pct, notes_pct, melody_pct, tempo_status, score, clear_w
         tips.append("Practice with the reference playing — finish each line before the reference ends.")
     elif tempo_status == "fast":
         tips.append("Don't rush — sing each word clearly at the reference tempo.")
-    elif tempo_status == "ok":
-        tips.append("Your length is close; try matching the reference beat-for-beat.")
+    elif tempo_status in ("ok", "bad"):
+        tips.append("Match the reference length — aim to finish within **±2 seconds** of the target.")
     if pron_pct < MIN_PRONUNCIATION_PCT:
         tips.append("Focus on **clear pronunciation** — listen to how each syllable is shaped in the reference.")
     elif pron_pct < 85:
@@ -361,8 +384,8 @@ def _coaching_tips(pron_pct, notes_pct, melody_pct, tempo_status, score, clear_w
 
 def _build_performance_feedback(mfcc_ref, mfcc_user, chroma_ref, chroma_user,
                                   f0_ref, f0_user, wp,
-                                  duration_ref, duration_user, time_ratio, score,
-                                  clear_words):
+                                  duration_ref, duration_user, delta_sec,
+                                  ok_sec, max_sec, score, clear_words):
     """User-facing breakdown + coaching tips (Raw Dist kept out of main UI)."""
     pron_d = _path_layer_distance(_articulation_mfcc(mfcc_ref), _articulation_mfcc(mfcc_user),
                                   wp, slice(0, 9))
@@ -372,7 +395,8 @@ def _build_performance_feedback(mfcc_ref, mfcc_user, chroma_ref, chroma_user,
     pron_pct = _layer_to_pct(pron_d, *_LAYER_ANCHORS["pronunciation"])
     notes_pct = _layer_to_pct(chroma_d, *_LAYER_ANCHORS["notes"])
     melody_pct = _layer_to_pct(pitch_d, *_LAYER_ANCHORS["melody"])
-    tempo_status, tempo_msg = _tempo_feedback(duration_ref, duration_user, time_ratio)
+    tempo_status, tempo_msg = _tempo_feedback(
+        duration_ref, duration_user, delta_sec, ok_sec, max_sec)
     tips = _coaching_tips(pron_pct, notes_pct, melody_pct, tempo_status, score, clear_words)
 
     return {
@@ -382,7 +406,41 @@ def _build_performance_feedback(mfcc_ref, mfcc_user, chroma_ref, chroma_user,
         "tempo_status": tempo_status,
         "tempo_msg": tempo_msg,
         "tips": tips,
+        "delta_sec": round(delta_sec, 1),
     }
+
+
+def _render_feedback_summary(saved, *, show_tips=True):
+    """Show stored or fresh breakdown bars for one padyam attempt."""
+    score = saved["score"]
+    feedback = saved["feedback"]
+    st.metric("Overall Match Score", f"{score}%")
+    if saved.get("attempt_no"):
+        st.caption(
+            f"🎙️ Attempt #{saved['attempt_no']} · Analyzed against: **{saved.get('display_name', '')}**"
+        )
+    if saved.get("wrong_song") and not show_tips:
+        st.error("**Wrong padyam** was detected on this attempt — score capped.")
+    st.caption(
+        "Pass uses **pronunciation + pacing (±2s target)** + **correct padyam**. "
+        "Musical notes and melody bars are coaching only."
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        st.progress(int(feedback["pronunciation_pct"]) / 100.0,
+                    text=f"🗣️ Pronunciation: {int(feedback['pronunciation_pct'])}%")
+        st.progress(int(feedback["notes_pct"]) / 100.0,
+                    text=f"🎵 Musical notes: {int(feedback['notes_pct'])}%")
+    with col2:
+        st.progress(int(feedback["melody_pct"]) / 100.0,
+                    text=f"🎼 Melody line: {int(feedback['melody_pct'])}%")
+        tempo_icon = {"good": "✅", "ok": "⚠️", "bad": "🐢", "slow": "🐢", "fast": "⚡"}.get(
+            feedback["tempo_status"], "⏱️")
+        st.info(f"{tempo_icon} **Pacing:** {feedback['tempo_msg']}")
+    if show_tips and feedback.get("tips"):
+        st.markdown("**Tips to improve:**")
+        for tip in feedback["tips"]:
+            st.markdown(f"- {tip}")
 
 # --- NORMALIZATION HELPERS (for forgiving login matching) ---
 def _norm_name(value):
@@ -836,7 +894,7 @@ if user_id and selected_song_path:
     try:
         _target_dur = librosa.get_duration(path=selected_song_path)
         st.caption(f"⏱️ Target length: about {int(round(_target_dur))} seconds — "
-                   f"sing the whole song before pressing stop.")
+                   f"aim to finish within **±{TEMPO_OK_SEC:.0f}s** of this (±{TEMPO_MAX_SEC:.0f}s max).")
     except Exception:
         pass
 
@@ -904,6 +962,12 @@ if user_id and selected_song_path:
         st.caption("Recorded. Press **Analyze** when ready — or **Discard & record again** "
                    "if you sang the wrong padyam or want a fresh take.")
 
+    last_fb = st.session_state.get("last_feedback", {}).get(song_key)
+    if last_fb and not do_analyze:
+        with st.expander("📋 Your last attempt on this padyam (this session)", expanded=False):
+            _render_feedback_summary(last_fb, show_tips=False)
+            st.caption("Record and **Analyze** again to update this summary.")
+
     if do_analyze:
         _touch_active_session()
         if _server_congested():
@@ -942,7 +1006,8 @@ if user_id and selected_song_path:
 
             # --- TIME CHECK (PACING) ---
             duration_user = librosa.get_duration(y=y_user, sr=sr_user)
-            time_ratio = min(duration_ref, duration_user) / max(duration_ref, duration_user)
+            tempo_factor, delta_sec, tempo_ok_sec, tempo_max_sec = _tempo_factor(
+                duration_ref, duration_user, is_final_test)
 
             # --- USER FEATURES (same hop as the cached reference) ---
             mfcc_user = librosa.feature.mfcc(y=y_user, sr=sr_user, n_mfcc=13, hop_length=hop_len)
@@ -1008,10 +1073,6 @@ if user_id and selected_song_path:
             else:
                 base_score = max(0.0, 95.0 - ((norm_dist - GOOD_MATCH_DIST) * PENALTY_SLOPE))
 
-            if time_ratio >= TEMPO_TOLERANCE:
-                tempo_factor = 1.0
-            else:
-                tempo_factor = max(0.0, (time_ratio - 0.5) / (TEMPO_TOLERANCE - 0.5))
             tempo_blend = (1.0 - TEMPO_WEIGHT) + (TEMPO_WEIGHT * tempo_factor)
             final_score = base_score * tempo_blend
 
@@ -1037,12 +1098,19 @@ if user_id and selected_song_path:
 
             feedback = _build_performance_feedback(
                 mfcc_ref, mfcc_user_norm, chroma_ref, chroma_user, f0_ref, f0_user_norm, wp,
-                duration_ref, duration_user, time_ratio, score, clear_words,
+                duration_ref, duration_user, delta_sec, tempo_ok_sec, tempo_max_sec,
+                score, clear_words,
             )
 
-            st.metric("Overall Match Score", f"{score}%")
-            st.caption(f"🎙️ Attempt #{attempt_no} for this song (this session). "
-                       f"Analyzed against: **{display_name}**")
+            wrong_flag = wrong_song or identity_blocks_pass
+            st.session_state.setdefault("last_feedback", {})[song_key] = {
+                "score": score,
+                "attempt_no": attempt_no,
+                "feedback": feedback,
+                "wrong_song": wrong_flag,
+                "display_name": display_name,
+            }
+
             if wrong_song:
                 st.error(
                     f"**Wrong padyam detected** — this recording does not match "
@@ -1059,28 +1127,8 @@ if user_id and selected_song_path:
                 )
 
             st.subheader("How you did")
-            st.caption(
-                "Pass requires: **(1) correct padyam** (lyrics/content), "
-                "**(2) clear pronunciation**, **(3) good pacing**. "
-                "The score above measures pronunciation + pacing against the **selected** "
-                "reference only — a different padyam can still score high if the tune is similar."
-            )
-            col1, col2 = st.columns(2)
-            with col1:
-                st.progress(int(feedback["pronunciation_pct"]) / 100.0,
-                            text=f"🗣️ Pronunciation: {int(feedback['pronunciation_pct'])}%")
-                st.progress(int(feedback["notes_pct"]) / 100.0,
-                            text=f"🎵 Musical notes: {int(feedback['notes_pct'])}%")
-            with col2:
-                st.progress(int(feedback["melody_pct"]) / 100.0,
-                            text=f"🎼 Melody line: {int(feedback['melody_pct'])}%")
-                tempo_icon = {"good": "✅", "ok": "⚠️", "slow": "🐢", "fast": "⚡"}.get(
-                    feedback["tempo_status"], "⏱️")
-                st.info(f"{tempo_icon} **Pacing:** {feedback['tempo_msg']}")
-
-            st.markdown("**Tips to improve:**")
-            for tip in feedback["tips"]:
-                st.markdown(f"- {tip}")
+            _render_feedback_summary(
+                st.session_state["last_feedback"][song_key], show_tips=True)
 
             with st.expander("Technical details (for organizers)"):
                 id_line = ""
@@ -1091,10 +1139,11 @@ if user_id and selected_song_path:
                     )
                 st.caption(
                     f"Raw Dist (articulation MFCC): {round(norm_dist, 2)} | "
-                    f"Tempo Acc: {round(time_ratio * 100, 1)}% | "
+                    f"Pacing Δ: {delta_sec:.1f}s (ok ≤{tempo_ok_sec:.1f}s, max {tempo_max_sec:.1f}s) | "
+                    f"Tempo factor: {round(tempo_factor, 2)} | "
                     f"Articulation ratio: {round(articulation_ratio, 2)} | "
                     f"Base score: {round(base_score, 1)} | Tempo blend: {round(tempo_blend, 2)} | "
-                    f"Ref length: {duration_ref:.1f}s{id_line}"
+                    f"Ref length: {duration_ref:.1f}s | User length: {duration_user:.1f}s{id_line}"
                 )
 
             # Rough timbre fingerprint of this recording (used only if they qualify)
