@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import librosa
 import numpy as np
 import gspread
@@ -6,6 +7,8 @@ from google.oauth2.service_account import Credentials
 import io
 import os
 import re
+import csv
+import shutil
 import hashlib
 import datetime
 import pandas as pd
@@ -16,8 +19,82 @@ import tune_core as tc
 
 # --- APP CONFIG ---
 st.set_page_config(page_title="Sataka Sankharavam Tune Matcher", page_icon="🎤")
+
+# Site-wide visual theme. Targets stable, version-agnostic selectors (semantic tags,
+# ARIA roles, BaseWeb hooks) plus a few well-known Streamlit testids, so the skin
+# survives Streamlit upgrades instead of breaking on internal DOM churn. Deliberately
+# leaves the stAudioInput rules further below untouched — that styling is separate
+# and already in place.
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: linear-gradient(180deg, #fff8ef 0%, #fffdfa 100%);
+    }
+    h1, h2, h3 {
+        color: #8b0000 !important;
+        font-family: Georgia, "Times New Roman", serif;
+    }
+    div[data-testid="stButton"] button,
+    div[data-testid="stFormSubmitButton"] button {
+        background: linear-gradient(180deg, #b00020 0%, #8b0000 100%);
+        color: #ffffff;
+        border: 1px solid #6e0000;
+        border-radius: 10px;
+        font-weight: 600;
+    }
+    div[data-testid="stButton"] button:hover,
+    div[data-testid="stFormSubmitButton"] button:hover {
+        background: linear-gradient(180deg, #c1121f 0%, #9d0208 100%);
+        border-color: #6e0000;
+        color: #ffffff;
+    }
+    div[data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #f0ddc0;
+        border-radius: 12px;
+        padding: 12px 16px;
+        box-shadow: 0 2px 8px rgba(139, 0, 0, 0.08);
+    }
+    div[role="progressbar"] > div {
+        background-color: #c9a227 !important;
+    }
+    div[data-testid="stAlert"] {
+        border-radius: 10px;
+    }
+    div[data-testid="stExpander"] {
+        border: 1px solid #f0ddc0;
+        border-radius: 10px;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        border-radius: 12px !important;
+        box-shadow: 0 2px 8px rgba(139, 0, 0, 0.06);
+    }
+    div[data-testid="stTextInput"] input,
+    div[data-baseweb="select"] {
+        border-radius: 8px !important;
+    }
+    audio {
+        width: 100%;
+        border-radius: 10px;
+    }
+    div[data-testid="stDataFrame"] {
+        border-radius: 10px;
+        overflow: hidden;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("🎤 Sataka Sankharavam Tune Matcher Challenge")
 st.write("Match the tune and timing at 85% or higher to pass!")
+
+# DEVMODE swaps the Google Sheets backend for a local CSV file, so the app is fully
+# usable (login + scoring + admin panel) without any Google credentials. Defaults to
+# False (real Google Sheets) so production behavior never changes silently; set the
+# DEVMODE env var to opt in for a local run, e.g. `DEVMODE=true streamlit run app.py`.
+DEVMODE = os.environ.get("DEVMODE", "false").strip().lower() in ("1", "true", "yes")
 
 # --- SERVER-SIDE SESSION TRACKING (single Streamlit process; best-effort on Community Cloud) ---
 # Counts browser sessions active within ACTIVE_SESSION_WINDOW_SEC. When congested, Analyze
@@ -81,11 +158,57 @@ def _logout_user():
 SHEET_COLUMNS = ["User ID", "Registration ID", "Song", "Score",
                  "Status", "Last Attempt", "Voice ID", "Voice Print"]
 
+# DEVMODE-only local backend. Seeded from the checked-in sample roster on first use,
+# then mutated like a real sheet so login/scoring can be tested end-to-end offline.
+# The live file is gitignored so local test runs don't pollute the sample template.
+LOCAL_SHEET_PATH = os.path.join("scripts", "local_sheet.csv")
+LOCAL_SHEET_SEED_PATH = os.path.join("scripts", "test_roster.csv")
+
+
+class _LocalCsvWorksheet:
+    """Minimal stand-in for a gspread Worksheet, backed by a local CSV file. Only
+    implements the handful of methods this app actually calls (get_all_records,
+    update, append_row) so the rest of the code doesn't need to know it's local."""
+
+    def __init__(self, path, seed_path):
+        self.path = path
+        if not os.path.exists(self.path):
+            if os.path.exists(seed_path):
+                shutil.copyfile(seed_path, self.path)
+            else:
+                with open(self.path, "w", newline="") as f:
+                    csv.DictWriter(f, fieldnames=SHEET_COLUMNS).writeheader()
+
+    def get_all_records(self):
+        with open(self.path, newline="") as f:
+            return list(csv.DictReader(f))
+
+    def _write_all(self, records):
+        with open(self.path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=SHEET_COLUMNS)
+            writer.writeheader()
+            writer.writerows(records)
+
+    def update(self, range_name, values, value_input_option="RAW"):
+        row_num = int(re.match(r"[A-Z]+(\d+)", range_name).group(1))
+        records = self.get_all_records()
+        records[row_num - 2] = dict(zip(SHEET_COLUMNS, values[0]))
+        self._write_all(records)
+
+    def append_row(self, values, value_input_option="RAW"):
+        records = self.get_all_records()
+        records.append(dict(zip(SHEET_COLUMNS, values)))
+        self._write_all(records)
+
 
 @st.cache_resource(show_spinner=False)
 def _get_worksheet():
     """Authorize a gspread worksheet handle from the service-account secrets.
-    Cached as a resource so we authorize once per app process (not per rerun)."""
+    Cached as a resource so we authorize once per app process (not per rerun).
+    In DEVMODE, returns a local CSV-backed stub instead so no Google credentials
+    are needed for a local run."""
+    if DEVMODE:
+        return _LocalCsvWorksheet(LOCAL_SHEET_PATH, LOCAL_SHEET_SEED_PATH)
     cfg = dict(st.secrets["connections"]["gsheets"])
     spreadsheet_url = cfg.pop("spreadsheet")
     worksheet_name = cfg.pop("worksheet", "Sheet1")
@@ -553,11 +676,12 @@ if "authenticated" not in st.session_state:
     st.session_state.registration_id = None
 
 if not st.session_state.authenticated:
-    st.subheader("🔐 Participant Login")
-    with st.form("login_form"):
-        login_name = st.text_input("Name (as registered):")
-        login_pwd = st.text_input("Registration ID:", type="password")
-        submitted = st.form_submit_button("Login")
+    with st.container(border=True):
+        st.subheader("🔐 Participant Login")
+        with st.form("login_form"):
+            login_name = st.text_input("Name (as registered):")
+            login_pwd = st.text_input("Registration ID:", type="password")
+            submitted = st.form_submit_button("Login")
 
     if submitted:
         try:
@@ -860,6 +984,71 @@ if user_id and selected_song_path:
         )
         audio_value = st.audio_input("Tap the microphone button to start recording",
                                      key=f"recorder_{song_key}_{rec_nonce}")
+
+    # Recording overlay: components.html runs in a same-origin iframe, which lets its
+    # script reach window.parent.document — st.markdown's <script> tags are stripped by
+    # Streamlit's sanitizer, so this is the only way to script the main page from here.
+    # The native st.audio_input widget has no Python-facing "recording started" event, so
+    # we detect it client-side via its action button's aria-label (Record <-> Stop
+    # recording) and mirror clicks onto that real button rather than reimplementing
+    # recording, which keeps the existing WAV capture/decoding path unchanged.
+    components.html(
+        """
+        <script>
+        (function() {
+            const doc = window.parent.document;
+            const OVERLAY_ID = "tm-record-overlay";
+            const BTN_SELECTOR = 'button[data-testid="stAudioInputActionButton"]';
+
+            function stopButton() {
+                const btn = doc.querySelector(BTN_SELECTOR);
+                return (btn && btn.getAttribute("aria-label") === "Stop recording") ? btn : null;
+            }
+
+            function showOverlay() {
+                if (doc.getElementById(OVERLAY_ID)) return;
+                const overlay = doc.createElement("div");
+                overlay.id = OVERLAY_ID;
+                overlay.style.cssText = "position:fixed;inset:0;z-index:999999;" +
+                    "background:rgba(20,0,0,0.6);display:flex;align-items:center;" +
+                    "justify-content:center;";
+                overlay.innerHTML =
+                    '<div style="background:#fff8ef;border-radius:16px;padding:32px 40px;' +
+                    'text-align:center;box-shadow:0 8px 30px rgba(0,0,0,0.35);' +
+                    'font-family:Georgia,\\'Times New Roman\\',serif;max-width:320px;">' +
+                    '<div style="font-size:1.3rem;font-weight:700;color:#b00020;' +
+                    'margin-bottom:6px;">🔴 Recording...</div>' +
+                    '<div style="color:#555;margin-bottom:18px;font-size:0.95rem;">' +
+                    'Sing the padyam, then tap Stop when finished.</div>' +
+                    '<button id="tm-overlay-stop-btn" style="background:linear-gradient(' +
+                    '180deg,#b00020 0%,#8b0000 100%);color:#fff;border:1px solid #6e0000;' +
+                    'border-radius:10px;font-weight:700;font-size:1rem;padding:12px 28px;' +
+                    'cursor:pointer;">⏹ Stop Recording</button></div>';
+                doc.body.appendChild(overlay);
+                doc.getElementById("tm-overlay-stop-btn").addEventListener("click", function() {
+                    const btn = stopButton();
+                    if (btn) btn.click();
+                });
+            }
+
+            function hideOverlay() {
+                const el = doc.getElementById(OVERLAY_ID);
+                if (el) el.remove();
+            }
+
+            function sync() {
+                if (stopButton()) showOverlay(); else hideOverlay();
+            }
+
+            sync();
+            new MutationObserver(sync).observe(doc.body, {
+                subtree: true, attributes: true, attributeFilter: ["aria-label"], childList: true,
+            });
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
     rec_col1, rec_col2 = st.columns(2)
     with rec_col1:
