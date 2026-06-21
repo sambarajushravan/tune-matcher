@@ -21,7 +21,7 @@ songs_trimmed/
 test_gsheets.py
 
 # DEVMODE local data store (mutated copy of scripts/test_roster.csv)
-scripts/local_sheet.csv
+# scripts/local_sheet.csv
 
 # OS / editor cruft
 .DS_Store
