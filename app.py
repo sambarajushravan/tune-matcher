@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import librosa
 import numpy as np
 import gspread
@@ -957,7 +956,8 @@ if user_id and selected_song_path:
             font-weight: 700 !important;
             color: #b00020 !important;
         }
-        /* Make the native record/stop button clearly red */
+        /* Make the native record/stop button clearly red, and large enough to be a
+           comfortable tap target on a phone. */
         div[data-testid="stAudioInput"] button {
             background-color: #e63946 !important;
             border: 2px solid #c1121f !important;
@@ -970,6 +970,19 @@ if user_id and selected_song_path:
         div[data-testid="stAudioInput"] button svg {
             fill: #ffffff !important;
             stroke: #ffffff !important;
+        }
+        button[data-testid="stAudioInputActionButton"] {
+            width: 88px !important;
+            height: 88px !important;
+            border-radius: 50% !important;
+        }
+        button[data-testid="stAudioInputActionButton"] svg {
+            width: 56px !important;
+            height: 56px !important;
+        }
+        div[data-testid="stAudioInputWaveSurfer"] {
+            min-height: 64px !important;
+            transform: scaleY(1.5);
         }
         </style>
         """,
@@ -984,71 +997,6 @@ if user_id and selected_song_path:
         )
         audio_value = st.audio_input("Tap the microphone button to start recording",
                                      key=f"recorder_{song_key}_{rec_nonce}")
-
-    # Recording overlay: components.html runs in a same-origin iframe, which lets its
-    # script reach window.parent.document — st.markdown's <script> tags are stripped by
-    # Streamlit's sanitizer, so this is the only way to script the main page from here.
-    # The native st.audio_input widget has no Python-facing "recording started" event, so
-    # we detect it client-side via its action button's aria-label (Record <-> Stop
-    # recording) and mirror clicks onto that real button rather than reimplementing
-    # recording, which keeps the existing WAV capture/decoding path unchanged.
-    components.html(
-        """
-        <script>
-        (function() {
-            const doc = window.parent.document;
-            const OVERLAY_ID = "tm-record-overlay";
-            const BTN_SELECTOR = 'button[data-testid="stAudioInputActionButton"]';
-
-            function stopButton() {
-                const btn = doc.querySelector(BTN_SELECTOR);
-                return (btn && btn.getAttribute("aria-label") === "Stop recording") ? btn : null;
-            }
-
-            function showOverlay() {
-                if (doc.getElementById(OVERLAY_ID)) return;
-                const overlay = doc.createElement("div");
-                overlay.id = OVERLAY_ID;
-                overlay.style.cssText = "position:fixed;inset:0;z-index:999999;" +
-                    "background:rgba(20,0,0,0.6);display:flex;align-items:center;" +
-                    "justify-content:center;";
-                overlay.innerHTML =
-                    '<div style="background:#fff8ef;border-radius:16px;padding:32px 40px;' +
-                    'text-align:center;box-shadow:0 8px 30px rgba(0,0,0,0.35);' +
-                    'font-family:Georgia,\\'Times New Roman\\',serif;max-width:320px;">' +
-                    '<div style="font-size:1.3rem;font-weight:700;color:#b00020;' +
-                    'margin-bottom:6px;">🔴 Recording...</div>' +
-                    '<div style="color:#555;margin-bottom:18px;font-size:0.95rem;">' +
-                    'Sing the padyam, then tap Stop when finished.</div>' +
-                    '<button id="tm-overlay-stop-btn" style="background:linear-gradient(' +
-                    '180deg,#b00020 0%,#8b0000 100%);color:#fff;border:1px solid #6e0000;' +
-                    'border-radius:10px;font-weight:700;font-size:1rem;padding:12px 28px;' +
-                    'cursor:pointer;">⏹ Stop Recording</button></div>';
-                doc.body.appendChild(overlay);
-                doc.getElementById("tm-overlay-stop-btn").addEventListener("click", function() {
-                    const btn = stopButton();
-                    if (btn) btn.click();
-                });
-            }
-
-            function hideOverlay() {
-                const el = doc.getElementById(OVERLAY_ID);
-                if (el) el.remove();
-            }
-
-            function sync() {
-                if (stopButton()) showOverlay(); else hideOverlay();
-            }
-
-            sync();
-            new MutationObserver(sync).observe(doc.body, {
-                subtree: true, attributes: true, attributeFilter: ["aria-label"], childList: true,
-            });
-        })();
-        </script>
-        """,
-        height=0,
-    )
 
     rec_col1, rec_col2 = st.columns(2)
     with rec_col1:
