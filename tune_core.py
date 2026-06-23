@@ -32,7 +32,7 @@ MAX_CONCURRENT_SESSIONS = 40
 INACTIVITY_LOGOUT_SEC = 600
 ACTIVE_SESSION_WINDOW_SEC = 300
 
-SONGS_CACHE_VERSION = 2
+SONGS_CACHE_VERSION = 3
 
 RefLoader = Callable[[str], Tuple[np.ndarray, np.ndarray]]
 
@@ -69,7 +69,10 @@ def extract_reference_features(ref_path: str):
 
     mfcc_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13, hop_length=hop_len)
     chroma_ref = librosa.feature.chroma_stft(y=y_ref, sr=sr_ref, hop_length=hop_len)
-    f0_ref, _, _ = librosa.pyin(
+    # yin (not pyin) here: f0 only feeds the "melody" coaching bar, never the pass/fail
+    # score, and yin is ~50-70x faster — pyin's extra voiced/unvoiced Viterbi decoding
+    # buys precision this coaching-only display doesn't need.
+    f0_ref = librosa.yin(
         y_ref,
         fmin=librosa.note_to_hz("C2"),
         fmax=librosa.note_to_hz("C7"),
