@@ -779,12 +779,9 @@ if st.session_state.authenticated:
             total_pages = max(1, -(-len(song_items) // SONGS_PER_PAGE))  # ceil division
             page = max(0, min(st.session_state.get("song_table_page", 0), total_pages - 1))
 
-            header = st.columns([3, 2, 2])
-            header[0].markdown("**Song**")
-            header[1].markdown("**Status**")
-            header[2].markdown("**Select**")
             # Before the selectbox below has ever run, mirror its own default (first
-            # not-yet-completed song, else the first song) so the right row is pre-highlighted.
+            # not-yet-completed song, else the first song) so the right option is
+            # pre-selected.
             if "song_select_box" in st.session_state:
                 current_label = st.session_state["song_select_box"]
             else:
@@ -792,31 +789,91 @@ if st.session_state.authenticated:
                                     next(iter(available_songs), None))
                 current_label = (_qualified_label(default_name, completed_songs.get(default_name))
                                  if default_name in completed_songs else default_name)
-            start = page * SONGS_PER_PAGE
-            for name, _ in song_items[start:start + SONGS_PER_PAGE]:
-                row = st.columns([3, 2, 2])
-                row[0].write(name)
+            current_name = next(
+                (n for n in available_songs if
+                 (_qualified_label(n, completed_songs.get(n)) if n in completed_songs else n)
+                 == current_label),
+                None,
+            )
+
+            def _status_text(name):
                 if name in completed_songs:
                     sc = completed_songs[name]
-                    row[1].markdown(f"✅ {sc:.1f}%" if sc is not None else "✅ Completed")
-                else:
-                    row[1].markdown("⏳ Remaining")
-                label = _qualified_label(name, completed_songs.get(name)) if name in completed_songs else name
-                if label == current_label:
-                    row[2].markdown("✅ Selected")
-                elif row[2].button("Select", key=f"select_{name}"):
+                    return f"{sc:.1f}% ✅" if sc is not None else "✅"
+                return ""
+
+            start = page * SONGS_PER_PAGE
+            page_names = [name for name, _ in song_items[start:start + SONGS_PER_PAGE]]
+            # A real table (st.dataframe), not per-row st.columns() — st.columns()
+            # collapses to a jumbled vertical stack on narrow screens, but a data
+            # table scrolls horizontally instead, so the grid never distorts.
+            # Click-to-select a row (native single-row selection) instead of a
+            # checkbox column; a Styler keeps the current song highlighted across
+            # reruns (native selection itself resets once we rerun) and zebra-stripes
+            # the rest — header bold/zebra aren't supported by this canvas-rendered
+            # grid's own API, but per-row background color is, via the Styler.
+            page_df = pd.DataFrame({
+                "Song": page_names,
+                "Status": [_status_text(n) for n in page_names],
+            })
+
+            def _row_style(row):
+                if row.name < len(page_names) and page_names[row.name] == current_name:
+                    return ["background-color: #ffe9a8"] * len(row)
+                if row.name % 2:
+                    return ["background-color: #f5f5f5"] * len(row)
+                return [""] * len(row)
+
+            styler = page_df.style.apply(_row_style, axis=1)
+            select_key = f"song_table_page_{page}"
+            st.dataframe(
+                styler,
+                hide_index=True,
+                width="stretch",
+                on_select="rerun",
+                selection_mode="single-row",
+                key=select_key,
+            )
+            selected_rows = st.session_state.get(select_key, {}).get("selection", {}).get("rows", [])
+            if selected_rows:
+                chosen_name = page_names[selected_rows[0]]
+                if chosen_name != current_name:
+                    label = (_qualified_label(chosen_name, completed_songs.get(chosen_name))
+                             if chosen_name in completed_songs else chosen_name)
                     st.session_state["song_select_box"] = label
                     st.rerun()
 
+            # No width="stretch" on these: st.columns() collapses to a full-width
+            # vertical stack on narrow phones, and a stretched button there becomes
+            # a giant full-width bar. Content-sized buttons stay small and usable
+            # whether the columns end up side-by-side (desktop) or stacked (mobile).
+            # Each column is itself a flex-direction:column container, so centering
+            # the button horizontally needs align-items (not justify-content, which
+            # would act on the vertical axis here) — scoped via the container's
+            # key-derived st-key-* class so it doesn't affect other columns.
+            st.markdown(
+                """
+                <style>
+                .st-key-nav_prev_box, .st-key-nav_next_box {
+                    align-items: center;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
             nav_prev, nav_info, nav_next = st.columns([1, 2, 1])
-            if nav_prev.button("⬅ Previous", disabled=(page == 0)):
-                st.session_state["song_table_page"] = page - 1
-                st.rerun()
+            with nav_prev:
+                with st.container(key="nav_prev_box"):
+                    if st.button("⬅️", disabled=(page == 0)):
+                        st.session_state["song_table_page"] = page - 1
+                        st.rerun()
             nav_info.markdown(f"<div style='text-align:center;'>Page {page + 1} of {total_pages}</div>",
                               unsafe_allow_html=True)
-            if nav_next.button("Next ➡", disabled=(page >= total_pages - 1)):
-                st.session_state["song_table_page"] = page + 1
-                st.rerun()
+            with nav_next:
+                with st.container(key="nav_next_box"):
+                    if st.button("➡️", disabled=(page >= total_pages - 1)):
+                        st.session_state["song_table_page"] = page + 1
+                        st.rerun()
 
     # 2. Song Selection (the final test, if present, is always offered last). Completed
     # songs are marked with ✅ but stay selectable in case they want to improve a score.
@@ -1259,7 +1316,7 @@ with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
                     st.subheader("🏆 Top Participant Progress")
                     leaderboard = passes_df["User ID"].value_counts().reset_index()
                     leaderboard.columns = ["User ID", "Songs Completed (Out of 18)"]
-                    st.dataframe(leaderboard, use_container_width=True)
+                    st.dataframe(leaderboard, width="stretch")
 
                     st.subheader("🎵 Completion Rates by Song")
                     song_counts = passes_df["Song"].value_counts()
@@ -1294,7 +1351,7 @@ with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
 
                     st.subheader("📋 Raw Activity Log")
                     log_cols = [c for c in passes_df.columns if c != "Voice Print"]
-                    st.dataframe(passes_df[log_cols].sort_values(by="Last Attempt", ascending=False), use_container_width=True)
+                    st.dataframe(passes_df[log_cols].sort_values(by="Last Attempt", ascending=False), width="stretch")
                 else:
                     st.info("No qualifications logged yet. No stats to report.")
             except Exception as e:
