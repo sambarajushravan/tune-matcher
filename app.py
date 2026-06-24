@@ -807,13 +807,16 @@ if st.session_state.authenticated:
             # A real table (st.dataframe), not per-row st.columns() — st.columns()
             # collapses to a jumbled vertical stack on narrow screens, but a data
             # table scrolls horizontally instead, so the grid never distorts.
-            # Click-to-select a row (native single-row selection) instead of a
-            # checkbox column; a Styler keeps the current song highlighted across
-            # reruns (native selection itself resets once we rerun) and zebra-stripes
-            # the rest — header bold/zebra aren't supported by this canvas-rendered
-            # grid's own API, but per-row background color is, via the Styler.
+            # selection_mode="single-row" only registers clicks on its own small
+            # indicator glyph, not the rest of the row — "single-cell" mode responds
+            # to a click anywhere in any cell instead, so clicking the Song or Status
+            # text also selects that row; we just read the row index back off the
+            # clicked cell and ignore which column it was. A Styler keeps the current
+            # song highlighted (the native per-cell outline alone isn't enough) and
+            # zebra-stripes the rest — header bold/zebra aren't supported by this
+            # canvas-rendered grid's own API, but per-row background color is, via Styler.
             page_df = pd.DataFrame({
-                "Song": page_names,
+                "Song": [f"🔘 {n}" if n == current_name else n for n in page_names],
                 "Status": [_status_text(n) for n in page_names],
             })
 
@@ -825,18 +828,25 @@ if st.session_state.authenticated:
                 return [""] * len(row)
 
             styler = page_df.style.apply(_row_style, axis=1)
-            select_key = f"song_table_page_{page}"
+            # Keying on current_name too forces a fresh widget instance whenever the
+            # selection changes, so selection_default re-applies and the native
+            # checkbox shows checked on the right row — selection_default only takes
+            # effect on a widget's first render, not on later reruns of the same key.
+            current_idx = page_names.index(current_name) if current_name in page_names else None
+            select_key = f"song_table_page_{page}_{current_name}"
             st.dataframe(
                 styler,
                 hide_index=True,
                 width="stretch",
                 on_select="rerun",
-                selection_mode="single-row",
+                selection_mode="single-cell",
+                selection_default=({"selection": {"cells": [[current_idx, "Song"]]}}
+                                   if current_idx is not None else None),
                 key=select_key,
             )
-            selected_rows = st.session_state.get(select_key, {}).get("selection", {}).get("rows", [])
-            if selected_rows:
-                chosen_name = page_names[selected_rows[0]]
+            selected_cells = st.session_state.get(select_key, {}).get("selection", {}).get("cells", [])
+            if selected_cells:
+                chosen_name = page_names[selected_cells[0][0]]
                 if chosen_name != current_name:
                     label = (_qualified_label(chosen_name, completed_songs.get(chosen_name))
                              if chosen_name in completed_songs else chosen_name)
