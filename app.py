@@ -86,6 +86,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+st.image("https://silverjubilee.siliconandhra.org/wp-content/uploads/2026/04/sasj-logo1.png",
+         width="stretch")
 st.title("🎤 Sataka Sankharavam Tune Matcher Challenge")
 st.write("Match the tune and timing at 85% or higher to pass!")
 
