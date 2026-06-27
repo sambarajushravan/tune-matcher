@@ -81,6 +81,12 @@ st.markdown(
         border-radius: 10px;
         overflow: hidden;
     }
+    /* Belt-and-suspenders fallback for [client] toolbarMode="minimal" in
+    .streamlit/config.toml: hides the Fork/"View on GitHub" toolbar buttons
+    even if that config isn't picked up (e.g. not yet deployed). */
+    div[data-testid="stToolbarActions"] {
+        display: none !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -88,8 +94,7 @@ st.markdown(
 
 st.image("https://silverjubilee.siliconandhra.org/wp-content/uploads/2026/04/sasj-logo1.png",
          width="stretch")
-st.title("🎤 Sataka Sankharavam Tune Matcher Challenge")
-st.write("Match the tune and timing at 85% or higher to pass!")
+st.caption("Need help? [Get support](https://forms.gle/PQhmtN4F1aDAtSUg9)")
 
 # DEVMODE swaps the Google Sheets backend for a local CSV file, so the app is fully
 # usable (login + scoring + admin panel) without any Google credentials. Defaults to
@@ -724,6 +729,10 @@ if "authenticated" not in st.session_state:
 if not st.session_state.authenticated:
     with st.container(border=True):
         st.subheader("🔐 Participant Login")
+        st.info(
+            "Registration and practice at [padyalu-sync.vercel.app]"
+            "(https://padyalu-sync.vercel.app) is a prerequisite to qualify here."
+        )
         with st.form("login_form"):
             login_name = st.text_input("Name (as registered):")
             login_pwd = st.text_input("Registration ID:", type="password")
@@ -1065,6 +1074,7 @@ if st.session_state.authenticated:
                 "sing the **whole padyam with clear words**, then tap **stop**. "
                 "Nothing is analyzed until you press **Analyze**."
             )
+            st.caption("Note: Match the tune and timing at 85% or higher to pass!")
             audio_value = st.audio_input("Tap the microphone button to start recording",
                                          key=f"recorder_{song_key}_{rec_nonce}")
 
