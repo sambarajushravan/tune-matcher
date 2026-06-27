@@ -135,6 +135,7 @@ def _logout_user():
     st.session_state.authenticated = False
     st.session_state.user_id = None
     st.session_state.registration_id = None
+    st.session_state.is_admin = False
     st.session_state.attempt_counts = {}
     for key in list(st.session_state.keys()):
         if (key.startswith("_audio_hash_") or key.startswith("_last_wrong_")
@@ -201,8 +202,11 @@ class _LocalCsvWorksheet:
 
 
 @st.cache_resource(show_spinner=False)
-def _get_worksheet():
+def _get_worksheet(kind="metrics"):
     """Authorize a gspread worksheet handle from the service-account secrets.
+    kind="login" -> the participants tab (roster lookups for sign-in only).
+    kind="admins" -> the admins tab (admin-status lookup for the logged-in user).
+    kind="metrics" -> the practise_metrics tab (status/score/voice reads + writes).
     Cached as a resource so we authorize once per app process (not per rerun).
     In DEVMODE, returns a local CSV-backed stub instead so no Google credentials
     are needed for a local run."""
@@ -210,7 +214,11 @@ def _get_worksheet():
         return _LocalCsvWorksheet(LOCAL_SHEET_PATH, LOCAL_SHEET_SEED_PATH)
     cfg = dict(st.secrets["connections"]["gsheets"])
     spreadsheet_url = cfg.pop("spreadsheet")
-    worksheet_name = cfg.pop("worksheet", "Sheet1")
+    login_worksheet = cfg.pop("worksheet", "Sheet1")
+    metrics_worksheet = cfg.pop("metrics_worksheet", login_worksheet)
+    admins_worksheet = cfg.pop("admins_worksheet", "admins")
+    worksheet_name = {"login": login_worksheet, "admins": admins_worksheet}.get(
+        kind, metrics_worksheet)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -220,9 +228,9 @@ def _get_worksheet():
     return client.open_by_url(spreadsheet_url).worksheet(worksheet_name)
 
 
-def _read_records():
-    """Live read of the whole sheet as a list of header-keyed dicts (1 API call)."""
-    return _get_worksheet().get_all_records()
+def _read_records(kind="metrics"):
+    """Live read of a worksheet as a list of header-keyed dicts (1 API call)."""
+    return _get_worksheet(kind).get_all_records()
 
 
 def _get_user_progress(user_id):
@@ -253,6 +261,18 @@ def _final_test_enabled():
     in secrets. Lets you turn it on/off on demand without a code change."""
     try:
         val = st.secrets["features"]["final_test"]
+    except (KeyError, FileNotFoundError):
+        return False
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(val)
+
+
+def _admin_reports_enabled():
+    """Admin Reports panel is OFF unless [features] admin_reports is truthy in
+    secrets. Lets you turn it on/off on demand without a code change."""
+    try:
+        val = st.secrets["features"]["admin_reports"]
     except (KeyError, FileNotFoundError):
         return False
     if isinstance(val, str):
@@ -496,7 +516,7 @@ def _get_roster():
     the whole sheet on every single login attempt. Trade-off: a participant added to
     the roster mid-event may take up to 5 minutes to be able to log in."""
     roster = []
-    for r in _read_records():
+    for r in _read_records("login"):
         name = str(r.get("User ID", "")).strip()
         reg = str(r.get("Registration ID", "")).strip()
         if name and reg:
@@ -504,14 +524,38 @@ def _get_roster():
     return roster
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_admin_roster():
+    """Cached list of (normalized_name, normalized_pwd, canonical_name, pwd)
+    from the admins tab (columns: User ID, Password). Admins manage the app
+    and are a separate population from participants (the participants tab is
+    imported from the registration portal, keyed on Registration ID instead)
+    — an admin need not be a registered participant to log in.
+    DEVMODE has no separate admins sheet, so nobody is an admin in a local run."""
+    if DEVMODE:
+        return []
+    roster = []
+    for r in _read_records("admins"):
+        name = str(r.get("User ID", "")).strip()
+        pwd = str(r.get("Password", "")).strip()
+        if name and pwd:
+            roster.append((_norm_name(name), _norm_pwd(pwd), name, pwd))
+    return roster
+
+
 def authenticate(username, password):
-    """Validate name + Registration ID against the cached roster.
-    Returns (canonical_user_id, registration_id) on success, else None."""
+    """Validate against the admins roster first (User ID + Password, a
+    separate population from participants), then the participants roster
+    (User ID + Registration ID). Returns (canonical_user_id, credential,
+    is_admin) on success, else None."""
     target_name = _norm_name(username)
     target_pwd = _norm_pwd(password)
+    for norm_name, norm_pwd, canonical_name, pwd in _get_admin_roster():
+        if norm_name == target_name and norm_pwd == target_pwd:
+            return canonical_name, pwd, True
     for norm_name, norm_pwd, canonical_name, reg_id in _get_roster():
         if norm_name == target_name and norm_pwd == target_pwd:
-            return canonical_name, reg_id
+            return canonical_name, reg_id, False
     return None
 
 
@@ -673,6 +717,7 @@ if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.user_id = None
     st.session_state.registration_id = None
+    st.session_state.is_admin = False
 
 if not st.session_state.authenticated:
     with st.container(border=True):
@@ -692,6 +737,7 @@ if not st.session_state.authenticated:
                 st.session_state.authenticated = True
                 st.session_state.user_id = result[0]
                 st.session_state.registration_id = result[1]
+                st.session_state.is_admin = result[2]
                 st.session_state.attempt_counts = {}  # fresh attempt tally per login
                 st.session_state.pop("completed_songs", None)
                 st.session_state.pop("final_done", None)
@@ -708,7 +754,8 @@ if st.session_state.authenticated:
     user_id = st.session_state.user_id
     _active_now = _active_session_count()
     header_col, logout_col = st.columns([3, 1])
-    header_col.success(f"Logged in as: {user_id}")
+    badge = " 🛠️ Admin" if st.session_state.get("is_admin") else ""
+    header_col.success(f"Logged in as: {user_id}{badge}")
     if logout_col.button("Log out"):
         _logout_user()
         st.rerun()
@@ -1286,23 +1333,32 @@ if st.session_state.authenticated:
             else:
                 st.error(f"Score: {score}%. You need 85% to qualify for {display_name}. Try again!")
 
-# --- ADMIN REPORTING SECTION (always available, gated by its own password) ---
-st.write("---")
-with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
-    admin_password = st.text_input("Enter Admin Password:", type="password")
+# --- ADMIN REPORTING SECTION ---
+# Visible if either [features] admin_reports is on (password-gated below) or the
+# logged-in user is listed on the admins tab (auto-unlocked, no password needed).
+_user_is_admin = st.session_state.get("is_admin", False)
+if _admin_reports_enabled() or _user_is_admin:
+    st.write("---")
+    with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
+        granted = _user_is_admin
+        if not granted:
+            admin_password = st.text_input("Enter Admin Password:", type="password")
+            if admin_password:
+                # Fetch the password safely from Streamlit's secrets manager. Guard against a
+                # missing [admin] secret so the panel never hard-crashes.
+                try:
+                    correct_password = st.secrets["admin"]["password"]
+                except (KeyError, FileNotFoundError):
+                    st.error("Admin password is not configured. Add an [admin] password to the app secrets.")
+                    correct_password = None
 
-    if admin_password:
-        # Fetch the password safely from Streamlit's secrets manager. Guard against a
-        # missing [admin] secret or a Sheets read failure so the panel never hard-crashes.
-        try:
-            correct_password = st.secrets["admin"]["password"]
-        except (KeyError, FileNotFoundError):
-            st.error("Admin password is not configured. Add an [admin] password to the app secrets.")
-            correct_password = None
+                if correct_password is not None:
+                    if admin_password == correct_password:
+                        granted = True
+                    else:
+                        st.error("Incorrect Password.")
 
-        if correct_password is None:
-            pass
-        elif admin_password == correct_password:
+        if granted:
             st.success("Access Granted! Fetching real-time reports...")
 
             try:
@@ -1366,5 +1422,3 @@ with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
                     st.info("No qualifications logged yet. No stats to report.")
             except Exception as e:
                 st.error("Could not load reports from Google Sheets right now. Please try again later.")
-        else:
-            st.error("Incorrect Password.")
