@@ -82,9 +82,9 @@ st.markdown(
         overflow: hidden;
     }
     /* Belt-and-suspenders fallback for [client] toolbarMode="minimal" in
-    .streamlit/config.toml: hides the Fork/"View on GitHub" toolbar buttons
-    even if that config isn't picked up (e.g. not yet deployed). */
-    div[data-testid="stToolbarActions"] {
+    .streamlit/config.toml: hides the whole header bar (Fork/GitHub buttons,
+    main menu) even if that config isn't picked up (e.g. not yet deployed). */
+    header[data-testid="stHeader"] {
         display: none !important;
     }
     </style>
