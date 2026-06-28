@@ -87,6 +87,16 @@ st.markdown(
     header[data-testid="stHeader"] {
         display: none !important;
     }
+    /* The hidden header still reserves its normal top padding on the main
+    content block; trim it down now that there's no header to make room for. */
+    div[data-testid="stMainBlockContainer"] {
+        padding-top: 1.5rem;
+    }
+    /* Streamlit auto-adds a "link to heading" anchor icon to every h1-h6;
+    not useful in this single-page app, so hide it everywhere. */
+    [data-testid="stHeaderActionElements"] {
+        display: none !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -97,7 +107,11 @@ with logo_col:
     st.image("https://silverjubilee.siliconandhra.org/wp-content/uploads/2026/04/sasj-logo1.png",
              width="stretch")
 with title_col:
-    st.title("🎤 శతక శంఖారావం అభ్యాసం")
+    st.markdown(
+        "<h1 style='text-align: center; margin: 0; "
+        "font-size: clamp(1.3rem, 5vw, 2.25rem);'>శతక శంఖారావం అభ్యాసం</h1>",
+        unsafe_allow_html=True,
+    )
 st.caption("Need help? [Get support](https://forms.gle/PQhmtN4F1aDAtSUg9)")
 
 # DEVMODE swaps the Google Sheets backend for a local CSV file, so the app is fully
