@@ -17,7 +17,7 @@ import uuid
 import tune_core as tc
 
 # --- APP CONFIG ---
-st.set_page_config(page_title="Sataka Sankharavam Tune Matcher", page_icon="🎤")
+st.set_page_config(page_title="శతక శంఖారావం అభ్యాసం", page_icon="🎤")
 
 # Site-wide visual theme. Targets stable, version-agnostic selectors (semantic tags,
 # ARIA roles, BaseWeb hooks) plus a few well-known Streamlit testids, so the skin
@@ -92,8 +92,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.image("https://silverjubilee.siliconandhra.org/wp-content/uploads/2026/04/sasj-logo1.png",
-         width="stretch")
+logo_col, title_col = st.columns([1, 2], vertical_alignment="center")
+with logo_col:
+    st.image("https://silverjubilee.siliconandhra.org/wp-content/uploads/2026/04/sasj-logo1.png",
+             width="stretch")
+with title_col:
+    st.title("🎤 శతక శంఖారావం అభ్యాసం")
 st.caption("Need help? [Get support](https://forms.gle/PQhmtN4F1aDAtSUg9)")
 
 # DEVMODE swaps the Google Sheets backend for a local CSV file, so the app is fully
@@ -730,8 +734,8 @@ if not st.session_state.authenticated:
     with st.container(border=True):
         st.subheader("🔐 Participant Login")
         st.info(
-            "Registration and practice at [padyalu-sync.vercel.app]"
-            "(https://padyalu-sync.vercel.app) is a prerequisite to qualify here."
+            "If you want to practice before taking this qualification, "
+            "please use 🎵 [this APP](https://padyalu-sync.vercel.app)."
         )
         with st.form("login_form"):
             login_name = st.text_input("Name (as registered):")
