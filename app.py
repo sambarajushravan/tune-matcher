@@ -6,6 +6,8 @@ from google.oauth2.service_account import Credentials
 import io
 import os
 import re
+import csv
+import shutil
 import hashlib
 import datetime
 import pandas as pd
@@ -15,9 +17,94 @@ import uuid
 import tune_core as tc
 
 # --- APP CONFIG ---
-st.set_page_config(page_title="Sataka Sankharavam Tune Matcher", page_icon="🎤")
-st.title("🎤 Sataka Sankharavam Tune Matcher Challenge")
-st.write("Match the tune and timing at 85% or higher to pass!")
+st.set_page_config(page_title="శతక శంఖారావం అభ్యాసం", page_icon="🎤")
+
+# Site-wide visual theme. Targets stable, version-agnostic selectors (semantic tags,
+# ARIA roles, BaseWeb hooks) plus a few well-known Streamlit testids, so the skin
+# survives Streamlit upgrades instead of breaking on internal DOM churn. Deliberately
+# leaves the stAudioInput rules further below untouched — that styling is separate
+# and already in place.
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: linear-gradient(180deg, #fff8ef 0%, #fffdfa 100%);
+    }
+    h1, h2, h3 {
+        color: #8b0000 !important;
+        font-family: Georgia, "Times New Roman", serif;
+    }
+    div[data-testid="stButton"] button,
+    div[data-testid="stFormSubmitButton"] button {
+        background: linear-gradient(180deg, #b00020 0%, #8b0000 100%);
+        color: #ffffff;
+        border: 1px solid #6e0000;
+        border-radius: 10px;
+        font-weight: 600;
+    }
+    div[data-testid="stButton"] button:hover,
+    div[data-testid="stFormSubmitButton"] button:hover {
+        background: linear-gradient(180deg, #c1121f 0%, #9d0208 100%);
+        border-color: #6e0000;
+        color: #ffffff;
+    }
+    div[data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #f0ddc0;
+        border-radius: 12px;
+        padding: 12px 16px;
+        box-shadow: 0 2px 8px rgba(139, 0, 0, 0.08);
+    }
+    div[role="progressbar"] > div {
+        background-color: #c9a227 !important;
+    }
+    div[data-testid="stAlert"] {
+        border-radius: 10px;
+    }
+    div[data-testid="stExpander"] {
+        border: 1px solid #f0ddc0;
+        border-radius: 10px;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        border-radius: 12px !important;
+        box-shadow: 0 2px 8px rgba(139, 0, 0, 0.06);
+    }
+    div[data-testid="stTextInput"] input,
+    div[data-baseweb="select"] {
+        border-radius: 8px !important;
+    }
+    audio {
+        width: 100%;
+        border-radius: 10px;
+    }
+    div[data-testid="stDataFrame"] {
+        border-radius: 10px;
+        overflow: hidden;
+    }
+    /* Belt-and-suspenders fallback for [client] toolbarMode="minimal" in
+    .streamlit/config.toml: hides the whole header bar (Fork/GitHub buttons,
+    main menu) even if that config isn't picked up (e.g. not yet deployed). */
+    header[data-testid="stHeader"] {
+        display: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+logo_col, title_col = st.columns([1, 2], vertical_alignment="center")
+with logo_col:
+    st.image("https://silverjubilee.siliconandhra.org/wp-content/uploads/2026/04/sasj-logo1.png",
+             width="stretch")
+with title_col:
+    st.title("🎤 శతక శంఖారావం అభ్యాసం")
+st.caption("Need help? [Get support](https://forms.gle/PQhmtN4F1aDAtSUg9)")
+
+# DEVMODE swaps the Google Sheets backend for a local CSV file, so the app is fully
+# usable (login + scoring + admin panel) without any Google credentials. Defaults to
+# False (real Google Sheets) so production behavior never changes silently; set the
+# DEVMODE env var to opt in for a local run, e.g. `DEVMODE=true streamlit run app.py`.
+DEVMODE = os.environ.get("DEVMODE", "false").strip().lower() in ("1", "true", "yes")
 
 # --- SERVER-SIDE SESSION TRACKING (single Streamlit process; best-effort on Community Cloud) ---
 # Counts browser sessions active within ACTIVE_SESSION_WINDOW_SEC. When congested, Analyze
@@ -59,6 +146,7 @@ def _logout_user():
     st.session_state.authenticated = False
     st.session_state.user_id = None
     st.session_state.registration_id = None
+    st.session_state.is_admin = False
     st.session_state.attempt_counts = {}
     for key in list(st.session_state.keys()):
         if (key.startswith("_audio_hash_") or key.startswith("_last_wrong_")
@@ -81,14 +169,67 @@ def _logout_user():
 SHEET_COLUMNS = ["User ID", "Registration ID", "Song", "Score",
                  "Status", "Last Attempt", "Voice ID", "Voice Print"]
 
+# DEVMODE-only local backend. Seeded from the checked-in sample roster on first use,
+# then mutated like a real sheet so login/scoring can be tested end-to-end offline.
+# The live file is gitignored so local test runs don't pollute the sample template.
+LOCAL_SHEET_PATH = os.path.join("scripts", "local_sheet.csv")
+LOCAL_SHEET_SEED_PATH = os.path.join("scripts", "test_roster.csv")
+
+
+class _LocalCsvWorksheet:
+    """Minimal stand-in for a gspread Worksheet, backed by a local CSV file. Only
+    implements the handful of methods this app actually calls (get_all_records,
+    update, append_row) so the rest of the code doesn't need to know it's local."""
+
+    def __init__(self, path, seed_path):
+        self.path = path
+        if not os.path.exists(self.path):
+            if os.path.exists(seed_path):
+                shutil.copyfile(seed_path, self.path)
+            else:
+                with open(self.path, "w", newline="") as f:
+                    csv.DictWriter(f, fieldnames=SHEET_COLUMNS).writeheader()
+
+    def get_all_records(self):
+        with open(self.path, newline="") as f:
+            return list(csv.DictReader(f))
+
+    def _write_all(self, records):
+        with open(self.path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=SHEET_COLUMNS)
+            writer.writeheader()
+            writer.writerows(records)
+
+    def update(self, range_name, values, value_input_option="RAW"):
+        row_num = int(re.match(r"[A-Z]+(\d+)", range_name).group(1))
+        records = self.get_all_records()
+        records[row_num - 2] = dict(zip(SHEET_COLUMNS, values[0]))
+        self._write_all(records)
+
+    def append_row(self, values, value_input_option="RAW"):
+        records = self.get_all_records()
+        records.append(dict(zip(SHEET_COLUMNS, values)))
+        self._write_all(records)
+
 
 @st.cache_resource(show_spinner=False)
-def _get_worksheet():
+def _get_worksheet(kind="metrics"):
     """Authorize a gspread worksheet handle from the service-account secrets.
-    Cached as a resource so we authorize once per app process (not per rerun)."""
+    kind="login" -> the participants tab (roster lookups for sign-in only).
+    kind="admins" -> the admins tab (admin-status lookup for the logged-in user).
+    kind="metrics" -> the practise_metrics tab (status/score/voice reads + writes).
+    Cached as a resource so we authorize once per app process (not per rerun).
+    In DEVMODE, returns a local CSV-backed stub instead so no Google credentials
+    are needed for a local run."""
+    if DEVMODE:
+        return _LocalCsvWorksheet(LOCAL_SHEET_PATH, LOCAL_SHEET_SEED_PATH)
     cfg = dict(st.secrets["connections"]["gsheets"])
     spreadsheet_url = cfg.pop("spreadsheet")
-    worksheet_name = cfg.pop("worksheet", "Sheet1")
+    login_worksheet = cfg.pop("worksheet", "Sheet1")
+    metrics_worksheet = cfg.pop("metrics_worksheet", login_worksheet)
+    admins_worksheet = cfg.pop("admins_worksheet", "admins")
+    worksheet_name = {"login": login_worksheet, "admins": admins_worksheet}.get(
+        kind, metrics_worksheet)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -98,9 +239,9 @@ def _get_worksheet():
     return client.open_by_url(spreadsheet_url).worksheet(worksheet_name)
 
 
-def _read_records():
-    """Live read of the whole sheet as a list of header-keyed dicts (1 API call)."""
-    return _get_worksheet().get_all_records()
+def _read_records(kind="metrics"):
+    """Live read of a worksheet as a list of header-keyed dicts (1 API call)."""
+    return _get_worksheet(kind).get_all_records()
 
 
 def _get_user_progress(user_id):
@@ -131,6 +272,18 @@ def _final_test_enabled():
     in secrets. Lets you turn it on/off on demand without a code change."""
     try:
         val = st.secrets["features"]["final_test"]
+    except (KeyError, FileNotFoundError):
+        return False
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(val)
+
+
+def _admin_reports_enabled():
+    """Admin Reports panel is OFF unless [features] admin_reports is truthy in
+    secrets. Lets you turn it on/off on demand without a code change."""
+    try:
+        val = st.secrets["features"]["admin_reports"]
     except (KeyError, FileNotFoundError):
         return False
     if isinstance(val, str):
@@ -374,7 +527,7 @@ def _get_roster():
     the whole sheet on every single login attempt. Trade-off: a participant added to
     the roster mid-event may take up to 5 minutes to be able to log in."""
     roster = []
-    for r in _read_records():
+    for r in _read_records("login"):
         name = str(r.get("User ID", "")).strip()
         reg = str(r.get("Registration ID", "")).strip()
         if name and reg:
@@ -382,14 +535,38 @@ def _get_roster():
     return roster
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_admin_roster():
+    """Cached list of (normalized_name, normalized_pwd, canonical_name, pwd)
+    from the admins tab (columns: User ID, Password). Admins manage the app
+    and are a separate population from participants (the participants tab is
+    imported from the registration portal, keyed on Registration ID instead)
+    — an admin need not be a registered participant to log in.
+    DEVMODE has no separate admins sheet, so nobody is an admin in a local run."""
+    if DEVMODE:
+        return []
+    roster = []
+    for r in _read_records("admins"):
+        name = str(r.get("User ID", "")).strip()
+        pwd = str(r.get("Password", "")).strip()
+        if name and pwd:
+            roster.append((_norm_name(name), _norm_pwd(pwd), name, pwd))
+    return roster
+
+
 def authenticate(username, password):
-    """Validate name + Registration ID against the cached roster.
-    Returns (canonical_user_id, registration_id) on success, else None."""
+    """Validate against the admins roster first (User ID + Password, a
+    separate population from participants), then the participants roster
+    (User ID + Registration ID). Returns (canonical_user_id, credential,
+    is_admin) on success, else None."""
     target_name = _norm_name(username)
     target_pwd = _norm_pwd(password)
+    for norm_name, norm_pwd, canonical_name, pwd in _get_admin_roster():
+        if norm_name == target_name and norm_pwd == target_pwd:
+            return canonical_name, pwd, True
     for norm_name, norm_pwd, canonical_name, reg_id in _get_roster():
         if norm_name == target_name and norm_pwd == target_pwd:
-            return canonical_name, reg_id
+            return canonical_name, reg_id, False
     return None
 
 
@@ -551,13 +728,19 @@ if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.user_id = None
     st.session_state.registration_id = None
+    st.session_state.is_admin = False
 
 if not st.session_state.authenticated:
-    st.subheader("🔐 Participant Login")
-    with st.form("login_form"):
-        login_name = st.text_input("Name (as registered):")
-        login_pwd = st.text_input("Registration ID:", type="password")
-        submitted = st.form_submit_button("Login")
+    with st.container(border=True):
+        st.subheader("🔐 Participant Login")
+        st.info(
+            "If you want to practice before taking this qualification, "
+            "please use 🎵 [this APP](https://padyalu-sync.vercel.app)."
+        )
+        with st.form("login_form"):
+            login_name = st.text_input("Name (as registered):")
+            login_pwd = st.text_input("Registration ID:", type="password")
+            submitted = st.form_submit_button("Login")
 
     if submitted:
         try:
@@ -569,6 +752,7 @@ if not st.session_state.authenticated:
                 st.session_state.authenticated = True
                 st.session_state.user_id = result[0]
                 st.session_state.registration_id = result[1]
+                st.session_state.is_admin = result[2]
                 st.session_state.attempt_counts = {}  # fresh attempt tally per login
                 st.session_state.pop("completed_songs", None)
                 st.session_state.pop("final_done", None)
@@ -580,23 +764,617 @@ if not st.session_state.authenticated:
             else:
                 st.error("Name or Registration ID is incorrect. Please check and try again.")
 
-# --- ADMIN REPORTING SECTION (always available, gated by its own password) ---
-st.write("---")
-with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
-    admin_password = st.text_input("Enter Admin Password:", type="password")
+# --- HEADER: logged-in status, logout, active-now (shown right under the title) ---
+if st.session_state.authenticated:
+    user_id = st.session_state.user_id
+    _active_now = _active_session_count()
+    header_col, logout_col = st.columns([3, 1])
+    badge = " 🛠️ Admin" if st.session_state.get("is_admin") else ""
+    header_col.success(f"Logged in as: {user_id}{badge}")
+    if logout_col.button("Log out"):
+        _logout_user()
+        st.rerun()
+    if _server_congested():
+        st.warning(
+            f"**High traffic right now** — about **{_active_now}** people are using the app. "
+            f"Please **wait a few minutes** before pressing **Analyze**. "
+            f"You can still listen to the reference and record your take. "
+            f"This keeps scoring fast and reliable for everyone."
+        )
+    else:
+        st.caption(f"Active now: ~{_active_now} participant(s) (last few minutes).")
 
-    if admin_password:
-        # Fetch the password safely from Streamlit's secrets manager. Guard against a
-        # missing [admin] secret or a Sheets read failure so the panel never hard-crashes.
+# Inactivity timeout + heartbeat (before participant UI).
+if st.session_state.authenticated:
+    last = st.session_state.get("_last_activity")
+    if last and time.time() - last > INACTIVITY_LOGOUT_SEC:
+        _logout_user()
+        st.warning(
+            "You were logged out after **10 minutes** of inactivity. "
+            "Please log in again. (Use **Log out** when switching to another family member.)"
+        )
+        st.rerun()
+    st.session_state._last_activity = time.time()
+    _touch_active_session()
+
+if st.session_state.authenticated:
+    # --- AUTHENTICATED PARTICIPANT FLOW ---
+    user_id = st.session_state.user_id
+
+    # --- DYNAMIC SONG LOADING ---
+    SONG_DIR = "songs"
+    # The final test is a single combined track of all 18 songs in sequence. It lives
+    # outside SONG_DIR so it is not listed as just another individual song.
+    FINAL_TEST_PATH = os.path.join("final", "all_songs.wav")
+    FINAL_TEST_LABEL = "🏆 FINAL TEST — Sing All 18 Songs in Sequence"
+    FINAL_TEST_KEY = "FINAL_TEST_ALL_SONGS"  # how the final test row is stored in the sheet
+
+    if os.path.exists(SONG_DIR):
+        available_songs = {f.replace('.wav', ''): os.path.join(SONG_DIR, f)
+                           for f in sorted(os.listdir(SONG_DIR)) if f.endswith('.wav')}
+    else:
+        available_songs = {}
+        st.error("Songs directory not found! Please check your GitHub folder structure.")
+
+    # Load this user's already-qualified songs once per session (one sheet read). It is
+    # then kept fresh in-session as they pass more songs, so we never re-read on reruns.
+    if "completed_songs" not in st.session_state:
         try:
-            correct_password = st.secrets["admin"]["password"]
-        except (KeyError, FileNotFoundError):
-            st.error("Admin password is not configured. Add an [admin] password to the app secrets.")
-            correct_password = None
+            completed, final_done, final_score = _get_user_progress(user_id)
+        except Exception:
+            completed, final_done, final_score = {}, False, None
+        st.session_state.completed_songs = completed
+        st.session_state.final_done = final_done
+        st.session_state.final_score = final_score
 
-        if correct_password is None:
+    completed_songs = st.session_state.completed_songs  # dict: song_key -> score (or None)
+
+    # Progress summary.
+    total_songs = len(available_songs)
+    done_here = [n for n in available_songs if n in completed_songs]
+
+    if available_songs:
+        with st.expander(f"🎵 Songs — Completed {len(done_here)} of {total_songs} songs",
+                         expanded=True):
+            SONGS_PER_PAGE = 5
+            song_items = list(available_songs.items())
+            total_pages = max(1, -(-len(song_items) // SONGS_PER_PAGE))  # ceil division
+            page = max(0, min(st.session_state.get("song_table_page", 0), total_pages - 1))
+
+            # Before the selectbox below has ever run, mirror its own default (first
+            # not-yet-completed song, else the first song) so the right option is
+            # pre-selected.
+            if "song_select_box" in st.session_state:
+                current_label = st.session_state["song_select_box"]
+            else:
+                default_name = next((n for n in available_songs if n not in completed_songs),
+                                    next(iter(available_songs), None))
+                current_label = (_qualified_label(default_name, completed_songs.get(default_name))
+                                 if default_name in completed_songs else default_name)
+            current_name = next(
+                (n for n in available_songs if
+                 (_qualified_label(n, completed_songs.get(n)) if n in completed_songs else n)
+                 == current_label),
+                None,
+            )
+
+            def _status_text(name):
+                if name in completed_songs:
+                    sc = completed_songs[name]
+                    return f"{sc:.1f}% ✅" if sc is not None else "✅"
+                return ""
+
+            start = page * SONGS_PER_PAGE
+            page_names = [name for name, _ in song_items[start:start + SONGS_PER_PAGE]]
+            # A real table (st.dataframe), not per-row st.columns() — st.columns()
+            # collapses to a jumbled vertical stack on narrow screens, but a data
+            # table scrolls horizontally instead, so the grid never distorts.
+            # selection_mode="single-row" only registers clicks on its own small
+            # indicator glyph, not the rest of the row — "single-cell" mode responds
+            # to a click anywhere in any cell instead, so clicking the Song or Status
+            # text also selects that row; we just read the row index back off the
+            # clicked cell and ignore which column it was. A Styler keeps the current
+            # song highlighted (the native per-cell outline alone isn't enough) and
+            # zebra-stripes the rest — header bold/zebra aren't supported by this
+            # canvas-rendered grid's own API, but per-row background color is, via Styler.
+            page_df = pd.DataFrame({
+                "Song": [f"🔘 {n}" if n == current_name else n for n in page_names],
+                "Status": [_status_text(n) for n in page_names],
+            })
+
+            def _row_style(row):
+                if row.name < len(page_names) and page_names[row.name] == current_name:
+                    return ["background-color: #ffe9a8"] * len(row)
+                if row.name % 2:
+                    return ["background-color: #f5f5f5"] * len(row)
+                return [""] * len(row)
+
+            styler = page_df.style.apply(_row_style, axis=1)
+            # Keying on current_name too forces a fresh widget instance whenever the
+            # selection changes, so selection_default re-applies and the native
+            # checkbox shows checked on the right row — selection_default only takes
+            # effect on a widget's first render, not on later reruns of the same key.
+            current_idx = page_names.index(current_name) if current_name in page_names else None
+            select_key = f"song_table_page_{page}_{current_name}"
+            st.dataframe(
+                styler,
+                hide_index=True,
+                width="stretch",
+                on_select="rerun",
+                selection_mode="single-cell",
+                selection_default=({"selection": {"cells": [[current_idx, "Song"]]}}
+                                   if current_idx is not None else None),
+                key=select_key,
+            )
+            selected_cells = st.session_state.get(select_key, {}).get("selection", {}).get("cells", [])
+            if selected_cells:
+                chosen_name = page_names[selected_cells[0][0]]
+                if chosen_name != current_name:
+                    label = (_qualified_label(chosen_name, completed_songs.get(chosen_name))
+                             if chosen_name in completed_songs else chosen_name)
+                    st.session_state["song_select_box"] = label
+                    st.rerun()
+
+            # No width="stretch" on these: st.columns() collapses to a full-width
+            # vertical stack on narrow phones, and a stretched button there becomes
+            # a giant full-width bar. Content-sized buttons stay small and usable
+            # whether the columns end up side-by-side (desktop) or stacked (mobile).
+            # Each column is itself a flex-direction:column container, so centering
+            # the button horizontally needs align-items (not justify-content, which
+            # would act on the vertical axis here) — scoped via the container's
+            # key-derived st-key-* class so it doesn't affect other columns.
+            st.markdown(
+                """
+                <style>
+                .st-key-nav_prev_box, .st-key-nav_next_box {
+                    align-items: center;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+            nav_prev, nav_info, nav_next = st.columns([1, 2, 1])
+            with nav_prev:
+                with st.container(key="nav_prev_box"):
+                    if st.button("⬅️", disabled=(page == 0)):
+                        st.session_state["song_table_page"] = page - 1
+                        st.rerun()
+            nav_info.markdown(f"<div style='text-align:center;'>Page {page + 1} of {total_pages}</div>",
+                              unsafe_allow_html=True)
+            with nav_next:
+                with st.container(key="nav_next_box"):
+                    if st.button("➡️", disabled=(page >= total_pages - 1)):
+                        st.session_state["song_table_page"] = page + 1
+                        st.rerun()
+
+    # 2. Song Selection (the final test, if present, is always offered last). Completed
+    # songs are marked with ✅ but stay selectable in case they want to improve a score.
+    selected_song_path = None
+    is_final_test = False
+    song_key = None       # value stored in the sheet's "Song" column
+    display_name = None   # friendly name used in user-facing messages
+
+    label_to_name = {}
+    options = []
+    for name in available_songs:
+        label = _qualified_label(name, completed_songs.get(name)) if name in completed_songs else name
+        label_to_name[label] = name
+        options.append(label)
+    # Final Test is only offered when its combined track exists AND it is enabled in
+    # secrets ([features] final_test = true). Off by default; enable on demand.
+    if os.path.exists(FINAL_TEST_PATH) and _final_test_enabled():
+        if st.session_state.get("final_done"):
+            final_label = _qualified_label(FINAL_TEST_LABEL, st.session_state.get("final_score"))
+        else:
+            final_label = FINAL_TEST_LABEL
+        label_to_name[final_label] = FINAL_TEST_LABEL
+        options.append(final_label)
+
+    if options:
+        # Default to the first not-yet-completed song so they land on something to do.
+        # Selection itself happens via the "Select" buttons in the songs table above —
+        # there's no dropdown here. Falls back to the default if the stored label is
+        # stale (e.g. a song's label changed after qualifying) or not yet set.
+        default_index = next((i for i, lbl in enumerate(options)
+                              if not lbl.startswith("✅")), 0)
+        if st.session_state.get("song_select_box") not in options:
+            st.session_state["song_select_box"] = options[default_index]
+        selected_label = st.session_state["song_select_box"]
+        selected_song_name = label_to_name[selected_label]
+        if selected_song_name == FINAL_TEST_LABEL:
+            is_final_test = True
+            selected_song_path = FINAL_TEST_PATH
+            song_key = FINAL_TEST_KEY
+            display_name = "the Final Test (all 18 songs)"
+            st.warning(
+                "🏆 **Final Test:** sing all 18 songs one after another, in the same order "
+                "as the reference, keeping pace with it. This is the full ~6 minute sequence — "
+                "play the reference first to follow along."
+            )
+        else:
+            selected_song_path = available_songs[selected_song_name]
+            song_key = selected_song_name
+            display_name = selected_song_name
+        st.warning(f"📌 **Selected padyam:** {display_name} — sing **this** poem in your recording.")
+        if song_key in completed_songs:
+            sc = completed_songs[song_key]
+            if sc is not None:
+                st.info(f"You've already qualified for this song with **{sc:.1f}%**.")
+            else:
+                st.info("You've already qualified for this song.")
+    else:
+        st.warning("No songs found in the /songs folder.")
+
+    if user_id and selected_song_path:
+        st.audio(selected_song_path)
+
+        # Show the target length so the singer knows roughly how long to sing (header read
+        # only — instant, no full decode).
+        try:
+            _target_dur = librosa.get_duration(path=selected_song_path)
+            st.caption(f"⏱️ Target length: about {int(round(_target_dur))} seconds — "
+                       f"aim to finish within **±{TEMPO_OK_SEC:.0f}s** of this (±{TEMPO_MAX_SEC:.0f}s max).")
+        except Exception:
             pass
-        elif admin_password == correct_password:
+
+        # Reset the mic widget when the dropdown changes so an old recording cannot
+        # be analyzed against a newly selected padyam.
+        if st.session_state.get("_active_song") != song_key:
+            st.session_state["_active_song"] = song_key
+            st.session_state["_rec_nonce"] = st.session_state.get("_rec_nonce", 0) + 1
+        rec_nonce = st.session_state["_rec_nonce"]
+
+        st.markdown(
+            """
+            <style>
+            div[data-testid="stAudioInput"] {
+                border: 3px solid #e63946;
+                border-radius: 14px;
+                padding: 16px 14px 10px;
+                background: linear-gradient(180deg, #fff5f5 0%, #ffffff 100%);
+                box-shadow: 0 2px 10px rgba(230, 57, 70, 0.15);
+            }
+            div[data-testid="stAudioInput"] label p {
+                font-size: 1.15rem !important;
+                font-weight: 700 !important;
+                color: #b00020 !important;
+            }
+            /* Make the native record/stop button clearly red, and large enough to be a
+               comfortable tap target on a phone. */
+            div[data-testid="stAudioInput"] button {
+                background-color: #e63946 !important;
+                border: 2px solid #c1121f !important;
+                color: #ffffff !important;
+            }
+            div[data-testid="stAudioInput"] button:hover {
+                background-color: #c1121f !important;
+                border-color: #9d0208 !important;
+            }
+            div[data-testid="stAudioInput"] button svg {
+                fill: #ffffff !important;
+                stroke: #ffffff !important;
+            }
+            button[data-testid="stAudioInputActionButton"] {
+                width: 88px !important;
+                height: 88px !important;
+                border-radius: 50% !important;
+            }
+            button[data-testid="stAudioInputActionButton"] svg {
+                width: 56px !important;
+                height: 56px !important;
+            }
+            div[data-testid="stAudioInputWaveSurfer"] {
+                min-height: 64px !important;
+                transform: scaleY(1.5);
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        with st.container(border=True):
+            st.markdown("### Step 2 — Record your singing")
+            st.markdown(
+                "In the **red box below**, tap the **microphone button** to start, "
+                "sing the **whole padyam with clear words**, then tap **stop**. "
+                "Nothing is analyzed until you press **Analyze**."
+            )
+            st.caption("Note: Match the tune and timing at 85% or higher to pass!")
+            audio_value = st.audio_input("Tap the microphone button to start recording",
+                                         key=f"recorder_{song_key}_{rec_nonce}")
+
+        rec_col1, rec_col2 = st.columns(2)
+        with rec_col1:
+            do_analyze = audio_value is not None and st.button(
+                "✅ Analyze my recording", key=f"analyze_{song_key}_{rec_nonce}")
+        with rec_col2:
+            if st.button("🔄 Discard & record again", key=f"reset_rec_{song_key}_{rec_nonce}"):
+                st.session_state["_rec_nonce"] = rec_nonce + 1
+                st.session_state.pop(f"_audio_hash_{song_key}", None)
+                st.session_state.pop(f"_last_wrong_{song_key}", None)
+                st.rerun()
+        if audio_value is not None and not do_analyze:
+            st.caption("Recorded. Press **Analyze** when ready — or **Discard & record again** "
+                       "if you sang the wrong padyam or want a fresh take.")
+
+        last_fb = st.session_state.get("last_feedback", {}).get(song_key)
+        if last_fb and not do_analyze:
+            with st.expander("📋 Your last attempt on this padyam (this session)", expanded=False):
+                _render_feedback_summary(last_fb, show_tips=False)
+                st.caption("Record and **Analyze** again to update this summary.")
+
+        if do_analyze:
+            _touch_active_session()
+            if _server_congested():
+                st.warning(
+                    f"**Too many people analyzing at once** (~{_active_session_count()} active). "
+                    f"Please wait **2–5 minutes** and try **Analyze** again. "
+                    f"Your recording is still here — no need to re-record."
+                )
+                st.stop()
+            audio_bytes = audio_value.getvalue()
+            audio_hash = hashlib.md5(audio_bytes).hexdigest()
+            hash_key = f"_audio_hash_{song_key}"
+            if (st.session_state.get(hash_key) == audio_hash
+                    and st.session_state.get(f"_last_wrong_{song_key}")):
+                st.warning(
+                    "This is the **same recording** as your last attempt. "
+                    "Tap **Discard & record again**, then sing the **selected padyam** before analyzing."
+                )
+                st.stop()
+            st.session_state[hash_key] = audio_hash
+
+            # Live, per-session attempt counter (no sheet writes, no API calls).
+            attempt_counts = st.session_state.setdefault("attempt_counts", {})
+            attempt_counts[song_key] = attempt_counts.get(song_key, 0) + 1
+            attempt_no = attempt_counts[song_key]
+
+            with st.spinner("Analyzing your pronunciation, timing, and tune..."):
+                duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref = _load_reference(
+                    selected_song_path)
+
+                try:
+                    y_user, sr_user = librosa.load(io.BytesIO(audio_bytes), sr=22050)
+                except Exception as e:
+                    st.error("Audio decoding error. Please try recording again.")
+                    st.stop()
+
+                # --- TIME CHECK (PACING) ---
+                duration_user = librosa.get_duration(y=y_user, sr=sr_user)
+                tempo_factor, delta_sec, tempo_ok_sec, tempo_max_sec = _tempo_factor(
+                    duration_ref, duration_user, is_final_test)
+
+                # --- USER FEATURES (same hop as the cached reference) ---
+                mfcc_user = librosa.feature.mfcc(y=y_user, sr=sr_user, n_mfcc=13, hop_length=hop_len)
+                # Layer B: Musical Notes (Chroma)
+                chroma_user = librosa.feature.chroma_stft(y=y_user, sr=sr_user, hop_length=hop_len)
+                # Layer C: Pitch Tracking (f0) — yin, not pyin: coaching-only melody bar,
+                # never the pass/fail score, and yin is ~50-70x faster than pyin.
+                f0_user = librosa.yin(y_user, fmin=librosa.note_to_hz('C2'),
+                                      fmax=librosa.note_to_hz('C7'), sr=sr_user, hop_length=hop_len)
+                f0_user = np.nan_to_num(f0_user)
+
+                f0_user_norm = (f0_user - np.mean(f0_user)) / (np.std(f0_user) + 1e-6) if np.std(f0_user) > 0 else f0_user
+                f0_user_norm = f0_user_norm.reshape(1, -1)
+                mfcc_user_norm = (mfcc_user - np.mean(mfcc_user)) / (np.std(mfcc_user) + 1e-6)
+                mfcc_ref_art = _articulation_mfcc(mfcc_ref)
+                mfcc_user_art = _articulation_mfcc(mfcc_user_norm)
+                articulation_ratio = _articulation_ratio(mfcc_ref, mfcc_user_norm)
+
+                # --- 4. DTW ON ARTICULATION MFCC — pass/fail score driver ---
+                try:
+                    D, wp = librosa.sequence.dtw(
+                        X=mfcc_ref_art,
+                        Y=mfcc_user_art,
+                        metric='euclidean',
+                        backtrack=True,
+                        global_constraints=True,
+                        band_rad=0.1
+                    )
+                except Exception:
+                    try:
+                        D, wp = librosa.sequence.dtw(
+                            X=mfcc_ref_art,
+                            Y=mfcc_user_art,
+                            metric='euclidean',
+                            backtrack=True
+                        )
+                    except Exception:
+                        st.error("Couldn't analyze this recording — it may be too short or "
+                                 "silent. Please record again.")
+                        st.stop()
+
+                final_accumulated_cost = D[-1, -1]
+                path_length = len(wp)
+                norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100.0
+
+                # --- Wrong-poem check: which padyam did they ACTUALLY sing? ---
+                wrong_song = False
+                identity_best = None
+                identity_sel_d = identity_best_d = None
+                if not is_final_test:
+                    wrong_song, identity_best, identity_sel_d, identity_best_d = _detect_wrong_song(
+                        song_key, chroma_user, mfcc_user_norm, available_songs)
+                identity_blocks_pass = tc.identity_blocks_pass(
+                    song_key, identity_best, identity_sel_d, identity_best_d,
+                    is_final_test=is_final_test)
+
+                # --- 5. FINAL SCORE: articulation (word clarity) + pacing to SELECTED ref ---
+                # Note: this score alone does NOT prove the correct padyam — similar tunes can
+                # score high against the wrong reference. wrong_song (above) enforces lyrics.
+                if norm_dist <= GOOD_MATCH_DIST:
+                    base_score = 100.0 - ((norm_dist / GOOD_MATCH_DIST) * 5.0)
+                else:
+                    base_score = max(0.0, 95.0 - ((norm_dist - GOOD_MATCH_DIST) * PENALTY_SLOPE))
+
+                tempo_blend = (1.0 - TEMPO_WEIGHT) + (TEMPO_WEIGHT * tempo_factor)
+                final_score = base_score * tempo_blend
+
+                # Safe NaN / Infinity boundary protection
+                if np.isnan(final_score) or np.isinf(final_score):
+                    score = 0.0
+                else:
+                    score = round(float(final_score), 2)
+
+                if wrong_song:
+                    score = min(score, 35.0)
+                    st.session_state[f"_last_wrong_{song_key}"] = True
+                else:
+                    st.session_state.pop(f"_last_wrong_{song_key}", None)
+
+                if identity_blocks_pass and not wrong_song:
+                    score = min(score, 35.0)
+
+                pron_d = _path_layer_distance(mfcc_ref_art, mfcc_user_art, wp, slice(0, 9))
+                pron_pct = _layer_to_pct(pron_d, *_LAYER_ANCHORS["pronunciation"])
+                clear_words = (pron_pct >= MIN_PRONUNCIATION_PCT
+                               and articulation_ratio >= MIN_ARTICULATION_RATIO)
+
+                feedback = _build_performance_feedback(
+                    mfcc_ref, mfcc_user_norm, chroma_ref, chroma_user, f0_ref, f0_user_norm, wp,
+                    duration_ref, duration_user, delta_sec, tempo_ok_sec, tempo_max_sec,
+                    score, clear_words,
+                )
+
+                wrong_flag = wrong_song or identity_blocks_pass
+                st.session_state.setdefault("last_feedback", {})[song_key] = {
+                    "score": score,
+                    "attempt_no": attempt_no,
+                    "feedback": feedback,
+                    "wrong_song": wrong_flag,
+                    "display_name": display_name,
+                }
+
+                if wrong_song:
+                    st.error(
+                        f"**Wrong padyam detected** — this recording does not match "
+                        f"**{display_name}**. "
+                        f"Please sing the **selected** padyam's lyrics and tap "
+                        f"**Discard & record again**."
+                    )
+                elif identity_blocks_pass:
+                    st.error(
+                        f"**Wrong padyam detected** — this recording does not match "
+                        f"**{display_name}**. "
+                        f"Please sing the **selected** padyam's lyrics and tap "
+                        f"**Discard & record again**."
+                    )
+
+                st.subheader("How you did")
+                _render_feedback_summary(
+                    st.session_state["last_feedback"][song_key], show_tips=True)
+
+                with st.expander("Technical details (for organizers)"):
+                    id_line = ""
+                    if identity_sel_d is not None:
+                        id_line = (
+                            f" | Identity: selected={round(identity_sel_d, 3)}"
+                            f", best={round(identity_best_d, 3)} ({identity_best})"
+                        )
+                    st.caption(
+                        f"Raw Dist (articulation MFCC): {round(norm_dist, 2)} | "
+                        f"Pacing Δ: {delta_sec:.1f}s (ok ≤{tempo_ok_sec:.1f}s, max {tempo_max_sec:.1f}s) | "
+                        f"Tempo factor: {round(tempo_factor, 2)} | "
+                        f"Articulation ratio: {round(articulation_ratio, 2)} | "
+                        f"Base score: {round(base_score, 1)} | Tempo blend: {round(tempo_blend, 2)} | "
+                        f"Ref length: {duration_ref:.1f}s | User length: {duration_user:.1f}s{id_line}"
+                    )
+
+                # Rough timbre fingerprint of this recording (used only if they qualify)
+                voice_sig = _voice_signature(mfcc_user)
+
+            # --- GOOGLE SHEETS UPSERT LOGIC ---
+            qualified = (score >= 85 and clear_words and not wrong_song
+                         and not identity_blocks_pass)
+
+            if wrong_song or identity_blocks_pass:
+                pass  # error already shown above; score capped — cannot qualify
+            elif score >= 85 and not clear_words:
+                st.warning(
+                    f"Score: {score}% — but **clear pronunciation is required** to qualify "
+                    f"(need {MIN_PRONUNCIATION_PCT}%+ pronunciation). "
+                    f"**Sing every word** — humming or mumbling the tune alone won't pass."
+                )
+            elif qualified:
+                st.balloons()
+                st.success(f"🎉 PASS! You qualified for {display_name} with {score}%!")
+
+                # If they've already passed this (per the progress loaded at login), do NOT
+                # touch the sheet at all — no read, no write. Scores aren't improved once
+                # passed, so repeat passes cost zero API calls. This is the main thing that
+                # keeps us well under the rate limits during busy periods.
+                if is_final_test:
+                    already_passed = bool(st.session_state.get("final_done"))
+                else:
+                    already_passed = song_key in st.session_state.get("completed_songs", {})
+
+                if already_passed:
+                    st.info("You've already qualified for this earlier — keeping your existing "
+                            "result. (Scores aren't updated once you've passed.)")
+                else:
+                    # Saving must never crash the app: if the Sheet is unreachable, the user
+                    # still sees their passing score.
+                    try:
+                        saved, prev_score, songs_passed = _save_qualification(
+                            user_id=user_id,
+                            reg_id=st.session_state.registration_id,
+                            song_key=song_key,
+                            score=score,
+                            voice_sig=voice_sig,
+                            is_final_test=is_final_test,
+                            final_key=FINAL_TEST_KEY,
+                        )
+
+                        # Keep in-session progress fresh so ✅ marks update without a re-read.
+                        if is_final_test:
+                            st.session_state.final_done = True
+                            st.session_state.final_score = score
+                        else:
+                            updated = dict(st.session_state.get("completed_songs", {}))
+                            updated[song_key] = score
+                            st.session_state.completed_songs = updated
+
+                        if is_final_test:
+                            st.snow()
+                            st.success("🏆 CONGRATULATIONS! You passed the FINAL TEST — "
+                                       "all 18 songs sung in sequence!")
+                        else:
+                            st.success("Result saved!")
+                            st.info(f"Progress: You have qualified for {songs_passed} out of 18 songs!")
+                            if songs_passed == 18:
+                                st.snow()
+                                st.success("🏆 AMAZING! You have qualified for ALL 18 songs!")
+                    except Exception as e:
+                        st.warning("Your score counts, but we couldn't reach the leaderboard right now. "
+                                   "(Check that the Google Sheet is shared with the service account email.)")
+            else:
+                st.error(f"Score: {score}%. You need 85% to qualify for {display_name}. Try again!")
+
+# --- ADMIN REPORTING SECTION ---
+# Visible if either [features] admin_reports is on (password-gated below) or the
+# logged-in user is listed on the admins tab (auto-unlocked, no password needed).
+_user_is_admin = st.session_state.get("is_admin", False)
+if _admin_reports_enabled() or _user_is_admin:
+    st.write("---")
+    with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
+        granted = _user_is_admin
+        if not granted:
+            admin_password = st.text_input("Enter Admin Password:", type="password")
+            if admin_password:
+                # Fetch the password safely from Streamlit's secrets manager. Guard against a
+                # missing [admin] secret so the panel never hard-crashes.
+                try:
+                    correct_password = st.secrets["admin"]["password"]
+                except (KeyError, FileNotFoundError):
+                    st.error("Admin password is not configured. Add an [admin] password to the app secrets.")
+                    correct_password = None
+
+                if correct_password is not None:
+                    if admin_password == correct_password:
+                        granted = True
+                    else:
+                        st.error("Incorrect Password.")
+
+        if granted:
             st.success("Access Granted! Fetching real-time reports...")
 
             try:
@@ -620,7 +1398,7 @@ with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
                     st.subheader("🏆 Top Participant Progress")
                     leaderboard = passes_df["User ID"].value_counts().reset_index()
                     leaderboard.columns = ["User ID", "Songs Completed (Out of 18)"]
-                    st.dataframe(leaderboard, use_container_width=True)
+                    st.dataframe(leaderboard, width="stretch")
 
                     st.subheader("🎵 Completion Rates by Song")
                     song_counts = passes_df["Song"].value_counts()
@@ -655,474 +1433,8 @@ with st.expander("📊 Admin Reports & Statistics (Internal Use Only)"):
 
                     st.subheader("📋 Raw Activity Log")
                     log_cols = [c for c in passes_df.columns if c != "Voice Print"]
-                    st.dataframe(passes_df[log_cols].sort_values(by="Last Attempt", ascending=False), use_container_width=True)
+                    st.dataframe(passes_df[log_cols].sort_values(by="Last Attempt", ascending=False), width="stretch")
                 else:
                     st.info("No qualifications logged yet. No stats to report.")
             except Exception as e:
                 st.error("Could not load reports from Google Sheets right now. Please try again later.")
-        else:
-            st.error("Incorrect Password.")
-
-# Inactivity timeout + heartbeat (before participant UI).
-if st.session_state.authenticated:
-    last = st.session_state.get("_last_activity")
-    if last and time.time() - last > INACTIVITY_LOGOUT_SEC:
-        _logout_user()
-        st.warning(
-            "You were logged out after **10 minutes** of inactivity. "
-            "Please log in again. (Use **Log out** when switching to another family member.)"
-        )
-        st.rerun()
-    st.session_state._last_activity = time.time()
-    _touch_active_session()
-
-# Stop here until the participant logs in (admin panel above still renders).
-if not st.session_state.authenticated:
-    st.stop()
-
-# --- AUTHENTICATED PARTICIPANT FLOW ---
-user_id = st.session_state.user_id
-_active_now = _active_session_count()
-
-header_col, logout_col = st.columns([3, 1])
-header_col.success(f"Logged in as: {user_id}")
-if logout_col.button("Log out"):
-    _logout_user()
-    st.rerun()
-
-if _server_congested():
-    st.warning(
-        f"**High traffic right now** — about **{_active_now}** people are using the app. "
-        f"Please **wait a few minutes** before pressing **Analyze**. "
-        f"You can still listen to the reference and record your take. "
-        f"This keeps scoring fast and reliable for everyone."
-    )
-else:
-    st.caption(f"Active now: ~{_active_now} participant(s) (last few minutes).")
-
-# --- DYNAMIC SONG LOADING ---
-SONG_DIR = "songs"
-# The final test is a single combined track of all 18 songs in sequence. It lives
-# outside SONG_DIR so it is not listed as just another individual song.
-FINAL_TEST_PATH = os.path.join("final", "all_songs.wav")
-FINAL_TEST_LABEL = "🏆 FINAL TEST — Sing All 18 Songs in Sequence"
-FINAL_TEST_KEY = "FINAL_TEST_ALL_SONGS"  # how the final test row is stored in the sheet
-
-if os.path.exists(SONG_DIR):
-    available_songs = {f.replace('.wav', ''): os.path.join(SONG_DIR, f)
-                       for f in sorted(os.listdir(SONG_DIR)) if f.endswith('.wav')}
-else:
-    available_songs = {}
-    st.error("Songs directory not found! Please check your GitHub folder structure.")
-
-# Load this user's already-qualified songs once per session (one sheet read). It is
-# then kept fresh in-session as they pass more songs, so we never re-read on reruns.
-if "completed_songs" not in st.session_state:
-    try:
-        completed, final_done, final_score = _get_user_progress(user_id)
-    except Exception:
-        completed, final_done, final_score = {}, False, None
-    st.session_state.completed_songs = completed
-    st.session_state.final_done = final_done
-    st.session_state.final_score = final_score
-
-completed_songs = st.session_state.completed_songs  # dict: song_key -> score (or None)
-
-# Progress summary + lists of what's done and what's left.
-total_songs = len(available_songs)
-done_here = [n for n in available_songs if n in completed_songs]
-remaining = [n for n in available_songs if n not in completed_songs]
-st.progress(len(done_here) / total_songs if total_songs else 0.0,
-            text=f"Completed {len(done_here)} of {total_songs} songs")
-if done_here:
-    with st.expander(f"✅ Completed songs ({len(done_here)})"):
-        for n in done_here:
-            sc = completed_songs.get(n)
-            if sc is not None:
-                st.write(f"- {n} — **{sc:.1f}%**")
-            else:
-                st.write(f"- {n}")
-if remaining:
-    with st.expander(f"🎯 Remaining songs ({len(remaining)})"):
-        st.write("\n".join(f"- {n}" for n in remaining))
-
-# 2. Song Selection (the final test, if present, is always offered last). Completed
-# songs are marked with ✅ but stay selectable in case they want to improve a score.
-selected_song_path = None
-is_final_test = False
-song_key = None       # value stored in the sheet's "Song" column
-display_name = None   # friendly name used in user-facing messages
-
-label_to_name = {}
-options = []
-for name in available_songs:
-    label = _qualified_label(name, completed_songs.get(name)) if name in completed_songs else name
-    label_to_name[label] = name
-    options.append(label)
-# Final Test is only offered when its combined track exists AND it is enabled in
-# secrets ([features] final_test = true). Off by default; enable on demand.
-if os.path.exists(FINAL_TEST_PATH) and _final_test_enabled():
-    if st.session_state.get("final_done"):
-        final_label = _qualified_label(FINAL_TEST_LABEL, st.session_state.get("final_score"))
-    else:
-        final_label = FINAL_TEST_LABEL
-    label_to_name[final_label] = FINAL_TEST_LABEL
-    options.append(final_label)
-
-if options:
-    # Default to the first not-yet-completed song so they land on something to do.
-    default_index = next((i for i, lbl in enumerate(options)
-                          if not lbl.startswith("✅")), 0)
-    selected_label = st.selectbox("Choose a song to practice:", options, index=default_index)
-    selected_song_name = label_to_name[selected_label]
-    if selected_song_name == FINAL_TEST_LABEL:
-        is_final_test = True
-        selected_song_path = FINAL_TEST_PATH
-        song_key = FINAL_TEST_KEY
-        display_name = "the Final Test (all 18 songs)"
-        st.warning(
-            "🏆 **Final Test:** sing all 18 songs one after another, in the same order "
-            "as the reference, keeping pace with it. This is the full ~6 minute sequence — "
-            "play the reference first to follow along."
-        )
-    else:
-        selected_song_path = available_songs[selected_song_name]
-        song_key = selected_song_name
-        display_name = selected_song_name
-    st.warning(f"📌 **Selected padyam:** {display_name} — sing **this** poem in your recording.")
-    if song_key in completed_songs:
-        sc = completed_songs[song_key]
-        if sc is not None:
-            st.info(f"You've already qualified for this song with **{sc:.1f}%**.")
-        else:
-            st.info("You've already qualified for this song.")
-else:
-    st.warning("No songs found in the /songs folder.")
-
-if user_id and selected_song_path:
-    st.audio(selected_song_path)
-
-    # Show the target length so the singer knows roughly how long to sing (header read
-    # only — instant, no full decode).
-    try:
-        _target_dur = librosa.get_duration(path=selected_song_path)
-        st.caption(f"⏱️ Target length: about {int(round(_target_dur))} seconds — "
-                   f"aim to finish within **±{TEMPO_OK_SEC:.0f}s** of this (±{TEMPO_MAX_SEC:.0f}s max).")
-    except Exception:
-        pass
-
-    # Reset the mic widget when the dropdown changes so an old recording cannot
-    # be analyzed against a newly selected padyam.
-    if st.session_state.get("_active_song") != song_key:
-        st.session_state["_active_song"] = song_key
-        st.session_state["_rec_nonce"] = st.session_state.get("_rec_nonce", 0) + 1
-    rec_nonce = st.session_state["_rec_nonce"]
-
-    st.markdown(
-        """
-        <style>
-        div[data-testid="stAudioInput"] {
-            border: 3px solid #e63946;
-            border-radius: 14px;
-            padding: 16px 14px 10px;
-            background: linear-gradient(180deg, #fff5f5 0%, #ffffff 100%);
-            box-shadow: 0 2px 10px rgba(230, 57, 70, 0.15);
-        }
-        div[data-testid="stAudioInput"] label p {
-            font-size: 1.15rem !important;
-            font-weight: 700 !important;
-            color: #b00020 !important;
-        }
-        /* Make the native record/stop button clearly red */
-        div[data-testid="stAudioInput"] button {
-            background-color: #e63946 !important;
-            border: 2px solid #c1121f !important;
-            color: #ffffff !important;
-        }
-        div[data-testid="stAudioInput"] button:hover {
-            background-color: #c1121f !important;
-            border-color: #9d0208 !important;
-        }
-        div[data-testid="stAudioInput"] button svg {
-            fill: #ffffff !important;
-            stroke: #ffffff !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    with st.container(border=True):
-        st.markdown("### Step 2 — Record your singing")
-        st.markdown(
-            "In the **red box below**, tap the **microphone button** to start, "
-            "sing the **whole padyam with clear words**, then tap **stop**. "
-            "Nothing is analyzed until you press **Analyze**."
-        )
-        audio_value = st.audio_input("Tap the microphone button to start recording",
-                                     key=f"recorder_{song_key}_{rec_nonce}")
-
-    rec_col1, rec_col2 = st.columns(2)
-    with rec_col1:
-        do_analyze = audio_value is not None and st.button(
-            "✅ Analyze my recording", key=f"analyze_{song_key}_{rec_nonce}")
-    with rec_col2:
-        if st.button("🔄 Discard & record again", key=f"reset_rec_{song_key}_{rec_nonce}"):
-            st.session_state["_rec_nonce"] = rec_nonce + 1
-            st.session_state.pop(f"_audio_hash_{song_key}", None)
-            st.session_state.pop(f"_last_wrong_{song_key}", None)
-            st.rerun()
-    if audio_value is not None and not do_analyze:
-        st.caption("Recorded. Press **Analyze** when ready — or **Discard & record again** "
-                   "if you sang the wrong padyam or want a fresh take.")
-
-    last_fb = st.session_state.get("last_feedback", {}).get(song_key)
-    if last_fb and not do_analyze:
-        with st.expander("📋 Your last attempt on this padyam (this session)", expanded=False):
-            _render_feedback_summary(last_fb, show_tips=False)
-            st.caption("Record and **Analyze** again to update this summary.")
-
-    if do_analyze:
-        _touch_active_session()
-        if _server_congested():
-            st.warning(
-                f"**Too many people analyzing at once** (~{_active_session_count()} active). "
-                f"Please wait **2–5 minutes** and try **Analyze** again. "
-                f"Your recording is still here — no need to re-record."
-            )
-            st.stop()
-        audio_bytes = audio_value.getvalue()
-        audio_hash = hashlib.md5(audio_bytes).hexdigest()
-        hash_key = f"_audio_hash_{song_key}"
-        if (st.session_state.get(hash_key) == audio_hash
-                and st.session_state.get(f"_last_wrong_{song_key}")):
-            st.warning(
-                "This is the **same recording** as your last attempt. "
-                "Tap **Discard & record again**, then sing the **selected padyam** before analyzing."
-            )
-            st.stop()
-        st.session_state[hash_key] = audio_hash
-
-        # Live, per-session attempt counter (no sheet writes, no API calls).
-        attempt_counts = st.session_state.setdefault("attempt_counts", {})
-        attempt_counts[song_key] = attempt_counts.get(song_key, 0) + 1
-        attempt_no = attempt_counts[song_key]
-
-        with st.spinner("Analyzing your pronunciation, timing, and tune..."):
-            duration_ref, hop_len, mfcc_ref, chroma_ref, f0_ref = _load_reference(
-                selected_song_path)
-
-            try:
-                y_user, sr_user = librosa.load(io.BytesIO(audio_bytes), sr=22050)
-            except Exception as e:
-                st.error("Audio decoding error. Please try recording again.")
-                st.stop()
-
-            # --- TIME CHECK (PACING) ---
-            duration_user = librosa.get_duration(y=y_user, sr=sr_user)
-            tempo_factor, delta_sec, tempo_ok_sec, tempo_max_sec = _tempo_factor(
-                duration_ref, duration_user, is_final_test)
-
-            # --- USER FEATURES (same hop as the cached reference) ---
-            mfcc_user = librosa.feature.mfcc(y=y_user, sr=sr_user, n_mfcc=13, hop_length=hop_len)
-            # Layer B: Musical Notes (Chroma)
-            chroma_user = librosa.feature.chroma_stft(y=y_user, sr=sr_user, hop_length=hop_len)
-            # Layer C: Pitch Tracking (f0)
-            f0_user, _, _ = librosa.pyin(y_user, fmin=librosa.note_to_hz('C2'),
-                                         fmax=librosa.note_to_hz('C7'), sr=sr_user, hop_length=hop_len)
-            f0_user = np.nan_to_num(f0_user)
-
-            f0_user_norm = (f0_user - np.mean(f0_user)) / (np.std(f0_user) + 1e-6) if np.std(f0_user) > 0 else f0_user
-            f0_user_norm = f0_user_norm.reshape(1, -1)
-            mfcc_user_norm = (mfcc_user - np.mean(mfcc_user)) / (np.std(mfcc_user) + 1e-6)
-            mfcc_ref_art = _articulation_mfcc(mfcc_ref)
-            mfcc_user_art = _articulation_mfcc(mfcc_user_norm)
-            articulation_ratio = _articulation_ratio(mfcc_ref, mfcc_user_norm)
-
-            # --- 4. DTW ON ARTICULATION MFCC — pass/fail score driver ---
-            try:
-                D, wp = librosa.sequence.dtw(
-                    X=mfcc_ref_art,
-                    Y=mfcc_user_art,
-                    metric='euclidean',
-                    backtrack=True,
-                    global_constraints=True,
-                    band_rad=0.1
-                )
-            except Exception:
-                try:
-                    D, wp = librosa.sequence.dtw(
-                        X=mfcc_ref_art,
-                        Y=mfcc_user_art,
-                        metric='euclidean',
-                        backtrack=True
-                    )
-                except Exception:
-                    st.error("Couldn't analyze this recording — it may be too short or "
-                             "silent. Please record again.")
-                    st.stop()
-
-            final_accumulated_cost = D[-1, -1]
-            path_length = len(wp)
-            norm_dist = final_accumulated_cost / path_length if path_length > 0 else 100.0
-
-            # --- Wrong-poem check: which padyam did they ACTUALLY sing? ---
-            wrong_song = False
-            identity_best = None
-            identity_sel_d = identity_best_d = None
-            if not is_final_test:
-                wrong_song, identity_best, identity_sel_d, identity_best_d = _detect_wrong_song(
-                    song_key, chroma_user, mfcc_user_norm, available_songs)
-            identity_blocks_pass = tc.identity_blocks_pass(
-                song_key, identity_best, identity_sel_d, identity_best_d,
-                is_final_test=is_final_test)
-
-            # --- 5. FINAL SCORE: articulation (word clarity) + pacing to SELECTED ref ---
-            # Note: this score alone does NOT prove the correct padyam — similar tunes can
-            # score high against the wrong reference. wrong_song (above) enforces lyrics.
-            if norm_dist <= GOOD_MATCH_DIST:
-                base_score = 100.0 - ((norm_dist / GOOD_MATCH_DIST) * 5.0)
-            else:
-                base_score = max(0.0, 95.0 - ((norm_dist - GOOD_MATCH_DIST) * PENALTY_SLOPE))
-
-            tempo_blend = (1.0 - TEMPO_WEIGHT) + (TEMPO_WEIGHT * tempo_factor)
-            final_score = base_score * tempo_blend
-
-            # Safe NaN / Infinity boundary protection
-            if np.isnan(final_score) or np.isinf(final_score):
-                score = 0.0
-            else:
-                score = round(float(final_score), 2)
-
-            if wrong_song:
-                score = min(score, 35.0)
-                st.session_state[f"_last_wrong_{song_key}"] = True
-            else:
-                st.session_state.pop(f"_last_wrong_{song_key}", None)
-
-            if identity_blocks_pass and not wrong_song:
-                score = min(score, 35.0)
-
-            pron_d = _path_layer_distance(mfcc_ref_art, mfcc_user_art, wp, slice(0, 9))
-            pron_pct = _layer_to_pct(pron_d, *_LAYER_ANCHORS["pronunciation"])
-            clear_words = (pron_pct >= MIN_PRONUNCIATION_PCT
-                           and articulation_ratio >= MIN_ARTICULATION_RATIO)
-
-            feedback = _build_performance_feedback(
-                mfcc_ref, mfcc_user_norm, chroma_ref, chroma_user, f0_ref, f0_user_norm, wp,
-                duration_ref, duration_user, delta_sec, tempo_ok_sec, tempo_max_sec,
-                score, clear_words,
-            )
-
-            wrong_flag = wrong_song or identity_blocks_pass
-            st.session_state.setdefault("last_feedback", {})[song_key] = {
-                "score": score,
-                "attempt_no": attempt_no,
-                "feedback": feedback,
-                "wrong_song": wrong_flag,
-                "display_name": display_name,
-            }
-
-            if wrong_song:
-                st.error(
-                    f"**Wrong padyam detected** — this recording does not match "
-                    f"**{display_name}**. "
-                    f"Please sing the **selected** padyam's lyrics and tap "
-                    f"**Discard & record again**."
-                )
-            elif identity_blocks_pass:
-                st.error(
-                    f"**Wrong padyam detected** — this recording does not match "
-                    f"**{display_name}**. "
-                    f"Please sing the **selected** padyam's lyrics and tap "
-                    f"**Discard & record again**."
-                )
-
-            st.subheader("How you did")
-            _render_feedback_summary(
-                st.session_state["last_feedback"][song_key], show_tips=True)
-
-            with st.expander("Technical details (for organizers)"):
-                id_line = ""
-                if identity_sel_d is not None:
-                    id_line = (
-                        f" | Identity: selected={round(identity_sel_d, 3)}"
-                        f", best={round(identity_best_d, 3)} ({identity_best})"
-                    )
-                st.caption(
-                    f"Raw Dist (articulation MFCC): {round(norm_dist, 2)} | "
-                    f"Pacing Δ: {delta_sec:.1f}s (ok ≤{tempo_ok_sec:.1f}s, max {tempo_max_sec:.1f}s) | "
-                    f"Tempo factor: {round(tempo_factor, 2)} | "
-                    f"Articulation ratio: {round(articulation_ratio, 2)} | "
-                    f"Base score: {round(base_score, 1)} | Tempo blend: {round(tempo_blend, 2)} | "
-                    f"Ref length: {duration_ref:.1f}s | User length: {duration_user:.1f}s{id_line}"
-                )
-
-            # Rough timbre fingerprint of this recording (used only if they qualify)
-            voice_sig = _voice_signature(mfcc_user)
-
-        # --- GOOGLE SHEETS UPSERT LOGIC ---
-        qualified = (score >= 85 and clear_words and not wrong_song
-                     and not identity_blocks_pass)
-
-        if wrong_song or identity_blocks_pass:
-            pass  # error already shown above; score capped — cannot qualify
-        elif score >= 85 and not clear_words:
-            st.warning(
-                f"Score: {score}% — but **clear pronunciation is required** to qualify "
-                f"(need {MIN_PRONUNCIATION_PCT}%+ pronunciation). "
-                f"**Sing every word** — humming or mumbling the tune alone won't pass."
-            )
-        elif qualified:
-            st.balloons()
-            st.success(f"🎉 PASS! You qualified for {display_name} with {score}%!")
-
-            # If they've already passed this (per the progress loaded at login), do NOT
-            # touch the sheet at all — no read, no write. Scores aren't improved once
-            # passed, so repeat passes cost zero API calls. This is the main thing that
-            # keeps us well under the rate limits during busy periods.
-            if is_final_test:
-                already_passed = bool(st.session_state.get("final_done"))
-            else:
-                already_passed = song_key in st.session_state.get("completed_songs", {})
-
-            if already_passed:
-                st.info("You've already qualified for this earlier — keeping your existing "
-                        "result. (Scores aren't updated once you've passed.)")
-            else:
-                # Saving must never crash the app: if the Sheet is unreachable, the user
-                # still sees their passing score.
-                try:
-                    saved, prev_score, songs_passed = _save_qualification(
-                        user_id=user_id,
-                        reg_id=st.session_state.registration_id,
-                        song_key=song_key,
-                        score=score,
-                        voice_sig=voice_sig,
-                        is_final_test=is_final_test,
-                        final_key=FINAL_TEST_KEY,
-                    )
-
-                    # Keep in-session progress fresh so ✅ marks update without a re-read.
-                    if is_final_test:
-                        st.session_state.final_done = True
-                        st.session_state.final_score = score
-                    else:
-                        updated = dict(st.session_state.get("completed_songs", {}))
-                        updated[song_key] = score
-                        st.session_state.completed_songs = updated
-
-                    if is_final_test:
-                        st.snow()
-                        st.success("🏆 CONGRATULATIONS! You passed the FINAL TEST — "
-                                   "all 18 songs sung in sequence!")
-                    else:
-                        st.success("Result saved!")
-                        st.info(f"Progress: You have qualified for {songs_passed} out of 18 songs!")
-                        if songs_passed == 18:
-                            st.snow()
-                            st.success("🏆 AMAZING! You have qualified for ALL 18 songs!")
-                except Exception as e:
-                    st.warning("Your score counts, but we couldn't reach the leaderboard right now. "
-                               "(Check that the Google Sheet is shared with the service account email.)")
-        else:
-            st.error(f"Score: {score}%. You need 85% to qualify for {display_name}. Try again!")

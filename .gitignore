@@ -20,6 +20,9 @@ songs_trimmed/
 # Local connectivity test helper
 test_gsheets.py
 
+# DEVMODE local data store (mutated copy of scripts/test_roster.csv)
+# scripts/local_sheet.csv
+
 # OS / editor cruft
 .DS_Store
 .idea/
