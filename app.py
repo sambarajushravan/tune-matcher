@@ -17,7 +17,7 @@ import uuid
 import tune_core as tc
 
 # --- APP CONFIG ---
-st.set_page_config(page_title="శతక శంఖారావం అభ్యాసం", page_icon="🎤")
+st.set_page_config(page_title="శతక శంఖారావం అర్హత", page_icon="🎤")
 
 # Site-wide visual theme. Targets stable, version-agnostic selectors (semantic tags,
 # ARIA roles, BaseWeb hooks) plus a few well-known Streamlit testids, so the skin
@@ -109,7 +109,7 @@ with logo_col:
 with title_col:
     st.markdown(
         "<h1 style='text-align: center; margin: 0; "
-        "font-size: clamp(1.3rem, 5vw, 2.25rem);'>శతక శంఖారావం అభ్యాసం</h1>",
+        "font-size: clamp(1.3rem, 5vw, 2.25rem);'>శతక శంఖారావం అర్హత</h1>",
         unsafe_allow_html=True,
     )
 st.caption("Need help? [Get support](https://forms.gle/PQhmtN4F1aDAtSUg9)")
