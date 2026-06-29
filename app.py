@@ -748,8 +748,8 @@ if not st.session_state.authenticated:
     with st.container(border=True):
         st.subheader("🔐 Participant Login")
         st.info(
-            "If you want to practice before taking this qualification, "
-            "please use 🎵 [this APP](https://padyalu-sync.vercel.app)."
+            "**If you want to practice before taking this qualification, "
+            "please use 🎵 [this APP](https://padyalu-sync.vercel.app).**"
         )
         with st.form("login_form"):
             login_name = st.text_input("Name (as registered):")
