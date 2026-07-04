@@ -206,7 +206,8 @@ class _LocalCsvWorksheet:
 
     def get_all_records(self):
         with open(self.path, newline="") as f:
-            return list(csv.DictReader(f))
+            return [r for r in csv.DictReader(f)
+                    if any(str(v).strip() for v in r.values())]
 
     def _write_all(self, records):
         with open(self.path, "w", newline="") as f:
@@ -254,8 +255,10 @@ def _get_worksheet(kind="metrics"):
 
 
 def _read_records(kind="metrics"):
-    """Live read of a worksheet as a list of header-keyed dicts (1 API call)."""
-    return _get_worksheet(kind).get_all_records()
+    """Live read of a worksheet as a list of header-keyed dicts (1 API call),
+    with completely empty rows filtered out."""
+    return [r for r in _get_worksheet(kind).get_all_records()
+            if any(str(v).strip() for v in r.values())]
 
 
 def _get_user_progress(user_id):
@@ -522,6 +525,23 @@ def _render_feedback_summary(saved, *, show_tips=True):
         for tip in feedback["tips"]:
             st.markdown(f"- {tip}")
 
+# Roster refresh interval — how long to cache the participants/admins lists before
+# re-reading from Google Sheets. Set [features] roster_ttl_seconds in secrets.toml
+# to override (e.g. 60 for 1-minute refresh during events, 3600 for slow events).
+try:
+    _ROSTER_TTL = int(st.secrets["features"]["roster_ttl_seconds"])
+except (KeyError, FileNotFoundError, ValueError):
+    _ROSTER_TTL = 300  # default: 5 minutes
+
+# Page auto-refresh interval — if > 0, the entire page reruns every N seconds so
+# live scores and roster changes appear without a manual reload. Set
+# [features] page_refresh_seconds in secrets.toml (0 = disabled by default).
+try:
+    _PAGE_REFRESH = int(st.secrets["features"]["page_refresh_seconds"])
+except (KeyError, FileNotFoundError, ValueError):
+    _PAGE_REFRESH = 0  # default: disabled
+
+
 # --- NORMALIZATION HELPERS (for forgiving login matching) ---
 def _norm_name(value):
     """Lowercase + collapse any run of whitespace to a single space + strip.
@@ -534,12 +554,11 @@ def _norm_pwd(value):
     return "".join(str(value).split()).lower()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_ROSTER_TTL, show_spinner=False)
 def _get_roster():
     """Cached list of (normalized_name, normalized_pwd, canonical_name, reg_id).
-    Refreshes every 5 minutes and is shared across all sessions, so we don't re-read
-    the whole sheet on every single login attempt. Trade-off: a participant added to
-    the roster mid-event may take up to 5 minutes to be able to log in."""
+    Refresh interval is controlled by [features] roster_ttl_seconds in secrets.toml
+    (default 300 s). Lower this for faster roster updates mid-event."""
     roster = []
     for r in _read_records("login"):
         name = str(r.get("User ID", "")).strip()
@@ -549,7 +568,7 @@ def _get_roster():
     return roster
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=_ROSTER_TTL, show_spinner=False)
 def _get_admin_roster():
     """Cached list of (normalized_name, normalized_pwd, canonical_name, pwd)
     from the admins tab (columns: User ID, Password). Admins manage the app
@@ -1452,3 +1471,10 @@ if _admin_reports_enabled() or _user_is_admin:
                     st.info("No qualifications logged yet. No stats to report.")
             except Exception as e:
                 st.error("Could not load reports from Google Sheets right now. Please try again later.")
+
+# --- AUTO-REFRESH ---
+# If page_refresh_seconds > 0 in secrets.toml, sleep then rerun the whole page so
+# live scores and roster updates appear without a manual reload.
+if _PAGE_REFRESH > 0:
+    time.sleep(_PAGE_REFRESH)
+    st.rerun()
