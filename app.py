@@ -1227,9 +1227,6 @@ if st.session_state.authenticated:
                 if not is_final_test:
                     wrong_song, identity_best, identity_sel_d, identity_best_d = _detect_wrong_song(
                         song_key, chroma_user, mfcc_user_norm, available_songs)
-                identity_blocks_pass = tc.identity_blocks_pass(
-                    song_key, identity_best, identity_sel_d, identity_best_d,
-                    is_final_test=is_final_test)
 
                 # --- 5. FINAL SCORE: articulation (word clarity) + pacing to SELECTED ref ---
                 # Note: this score alone does NOT prove the correct padyam — similar tunes can
@@ -1254,9 +1251,6 @@ if st.session_state.authenticated:
                 else:
                     st.session_state.pop(f"_last_wrong_{song_key}", None)
 
-                if identity_blocks_pass and not wrong_song:
-                    score = min(score, 35.0)
-
                 pron_d = _path_layer_distance(mfcc_ref_art, mfcc_user_art, wp, slice(0, 9))
                 pron_pct = _layer_to_pct(pron_d, *_LAYER_ANCHORS["pronunciation"])
                 clear_words = (pron_pct >= MIN_PRONUNCIATION_PCT
@@ -1268,23 +1262,15 @@ if st.session_state.authenticated:
                     score, clear_words,
                 )
 
-                wrong_flag = wrong_song or identity_blocks_pass
                 st.session_state.setdefault("last_feedback", {})[song_key] = {
                     "score": score,
                     "attempt_no": attempt_no,
                     "feedback": feedback,
-                    "wrong_song": wrong_flag,
+                    "wrong_song": wrong_song,
                     "display_name": display_name,
                 }
 
                 if wrong_song:
-                    st.error(
-                        f"**Wrong padyam detected** — this recording does not match "
-                        f"**{display_name}**. "
-                        f"Please sing the **selected** padyam's lyrics and tap "
-                        f"**Discard & record again**."
-                    )
-                elif identity_blocks_pass:
                     st.error(
                         f"**Wrong padyam detected** — this recording does not match "
                         f"**{display_name}**. "
@@ -1316,10 +1302,9 @@ if st.session_state.authenticated:
                 voice_sig = _voice_signature(mfcc_user)
 
             # --- GOOGLE SHEETS UPSERT LOGIC ---
-            qualified = (score >= 85 and clear_words and not wrong_song
-                         and not identity_blocks_pass)
+            qualified = (score >= 85 and clear_words and not wrong_song)
 
-            if wrong_song or identity_blocks_pass:
+            if wrong_song:
                 pass  # error already shown above; score capped — cannot qualify
             elif score >= 85 and not clear_words:
                 st.warning(
