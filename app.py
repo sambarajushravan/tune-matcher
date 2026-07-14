@@ -1302,68 +1302,52 @@ if st.session_state.authenticated:
                 voice_sig = _voice_signature(mfcc_user)
 
             # --- GOOGLE SHEETS UPSERT LOGIC ---
-            qualified = (score >= 85 and clear_words and not wrong_song)
+            qualified = (score >= 85 and not wrong_song)
 
             if wrong_song:
                 pass  # error already shown above; score capped — cannot qualify
-            elif score >= 85 and not clear_words:
-                st.warning(
-                    f"Score: {score}% — but **clear pronunciation is required** to qualify "
-                    f"(need {MIN_PRONUNCIATION_PCT}%+ pronunciation). "
-                    f"**Sing every word** — humming or mumbling the tune alone won't pass."
-                )
             elif qualified:
                 st.balloons()
                 st.success(f"🎉 PASS! You qualified for {display_name} with {score}%!")
 
-                # If they've already passed this (per the progress loaded at login), do NOT
-                # touch the sheet at all — no read, no write. Scores aren't improved once
-                # passed, so repeat passes cost zero API calls. This is the main thing that
-                # keeps us well under the rate limits during busy periods.
-                if is_final_test:
-                    already_passed = bool(st.session_state.get("final_done"))
-                else:
-                    already_passed = song_key in st.session_state.get("completed_songs", {})
+                # Saving must never crash the app: if the Sheet is unreachable, the user
+                # still sees their passing score.
+                try:
+                    saved, prev_score, songs_passed = _save_qualification(
+                        user_id=user_id,
+                        reg_id=st.session_state.registration_id,
+                        song_key=song_key,
+                        score=score,
+                        voice_sig=voice_sig,
+                        is_final_test=is_final_test,
+                        final_key=FINAL_TEST_KEY,
+                    )
 
-                if already_passed:
-                    st.info("You've already qualified for this earlier — keeping your existing "
-                            "result. (Scores aren't updated once you've passed.)")
-                else:
-                    # Saving must never crash the app: if the Sheet is unreachable, the user
-                    # still sees their passing score.
-                    try:
-                        saved, prev_score, songs_passed = _save_qualification(
-                            user_id=user_id,
-                            reg_id=st.session_state.registration_id,
-                            song_key=song_key,
-                            score=score,
-                            voice_sig=voice_sig,
-                            is_final_test=is_final_test,
-                            final_key=FINAL_TEST_KEY,
-                        )
+                    # Keep in-session progress fresh so ✅ marks update without a re-read.
+                    if is_final_test:
+                        st.session_state.final_done = True
+                        st.session_state.final_score = score
+                    else:
+                        updated = dict(st.session_state.get("completed_songs", {}))
+                        updated[song_key] = score
+                        st.session_state.completed_songs = updated
 
-                        # Keep in-session progress fresh so ✅ marks update without a re-read.
-                        if is_final_test:
-                            st.session_state.final_done = True
-                            st.session_state.final_score = score
-                        else:
-                            updated = dict(st.session_state.get("completed_songs", {}))
-                            updated[song_key] = score
-                            st.session_state.completed_songs = updated
-
-                        if is_final_test:
+                    if is_final_test:
+                        st.snow()
+                        st.success("🏆 CONGRATULATIONS! You passed the FINAL TEST — "
+                                   "all 18 songs sung in sequence!")
+                    elif saved:
+                        st.success("Result saved!")
+                        st.info(f"Progress: You have qualified for {songs_passed} out of 18 songs!")
+                        if songs_passed == 18:
                             st.snow()
-                            st.success("🏆 CONGRATULATIONS! You passed the FINAL TEST — "
-                                       "all 18 songs sung in sequence!")
-                        else:
-                            st.success("Result saved!")
-                            st.info(f"Progress: You have qualified for {songs_passed} out of 18 songs!")
-                            if songs_passed == 18:
-                                st.snow()
-                                st.success("🏆 AMAZING! You have qualified for ALL 18 songs!")
-                    except Exception as e:
-                        st.warning("Your score counts, but we couldn't reach the leaderboard right now. "
-                                   "(Check that the Google Sheet is shared with the service account email.)")
+                            st.success("🏆 AMAZING! You have qualified for ALL 18 songs!")
+                    else:
+                        st.info(f"Your previous score of {prev_score}% for {display_name} "
+                                f"is already on record — keeping the higher result.")
+                except Exception as e:
+                    st.warning("Your score counts, but we couldn't reach the leaderboard right now. "
+                               "(Check that the Google Sheet is shared with the service account email.)")
             else:
                 st.error(f"Score: {score}%. You need 85% to qualify for {display_name}. Try again!")
 
