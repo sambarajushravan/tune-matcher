@@ -805,8 +805,7 @@ def _flush_pending_saves(final_key):
     for entry, saved, songs_passed in flushed:
         if saved:
             st.success(
-                f"✅ Synced queued result: **{entry['display_name']}** — {entry['score']}% "
-                f"(was saved offline during a temporary connection issue)"
+                f"✅ Your score of **{entry['score']}%** for {entry['display_name']} has been recorded!"
             )
             if not entry["is_final_test"]:
                 updated = dict(st.session_state.get("completed_songs", {}))
@@ -923,7 +922,7 @@ if st.session_state.authenticated:
 
     if st.session_state.get(_PENDING_SAVES_KEY):
         n = len(st.session_state[_PENDING_SAVES_KEY])
-        st.info(f"⏳ {n} result(s) pending sync — will retry automatically on the next interaction.")
+        st.info(f"⏳ Your result{'s are' if n > 1 else ' is'} queued and will be recorded shortly.")
 
     completed_songs = st.session_state.completed_songs  # dict: song_key -> score (or None)
 
@@ -1415,10 +1414,9 @@ if st.session_state.authenticated:
                         is_final_test=is_final_test,
                         display_name=display_name,
                     )
-                    st.warning(
-                        f"Your score of **{score}%** is saved locally and will sync automatically "
-                        f"once the connection is restored. No need to re-record. "
-                        f"({type(e).__name__}: {e})"
+                    st.info(
+                        f"🎉 You scored **{score}%** for {display_name}! "
+                        f"Your result is queued and will be recorded shortly."
                     )
             else:
                 st.error(f"Score: {score}%. You need 85% to qualify for {display_name}. Try again!")
