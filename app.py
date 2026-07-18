@@ -756,6 +756,64 @@ def _save_qualification(user_id, reg_id, song_key, score, voice_sig,
     return saved, prev_score, len(qualified_songs)
 
 
+_PENDING_SAVES_KEY = "_pending_saves"
+
+
+def _queue_save(user_id, reg_id, song_key, score, voice_sig, is_final_test, display_name):
+    """Store a failed qualifying save in session state for background retry."""
+    pending = st.session_state.setdefault(_PENDING_SAVES_KEY, [])
+    for entry in pending:
+        if entry["user_id"] == user_id and entry["song_key"] == song_key:
+            if score > entry["score"]:
+                entry["score"] = score
+                entry["voice_sig"] = voice_sig
+            return
+    pending.append({
+        "user_id": user_id,
+        "reg_id": reg_id,
+        "song_key": song_key,
+        "score": score,
+        "voice_sig": voice_sig,
+        "is_final_test": is_final_test,
+        "display_name": display_name,
+    })
+
+
+def _flush_pending_saves(final_key):
+    """Retry queued saves. Only writes if no equal-or-better score exists in the sheet.
+    Removes successfully flushed entries; leaves failures for the next rerun."""
+    pending = st.session_state.get(_PENDING_SAVES_KEY, [])
+    if not pending:
+        return
+    still_pending = []
+    flushed = []
+    for entry in pending:
+        try:
+            saved, _, songs_passed = _save_qualification(
+                user_id=entry["user_id"],
+                reg_id=entry["reg_id"],
+                song_key=entry["song_key"],
+                score=entry["score"],
+                voice_sig=entry["voice_sig"],
+                is_final_test=entry["is_final_test"],
+                final_key=final_key,
+            )
+            flushed.append((entry, saved, songs_passed))
+        except Exception:
+            still_pending.append(entry)
+    st.session_state[_PENDING_SAVES_KEY] = still_pending
+    for entry, saved, songs_passed in flushed:
+        if saved:
+            st.success(
+                f"✅ Synced queued result: **{entry['display_name']}** — {entry['score']}% "
+                f"(was saved offline during a temporary connection issue)"
+            )
+            if not entry["is_final_test"]:
+                updated = dict(st.session_state.get("completed_songs", {}))
+                updated[entry["song_key"]] = entry["score"]
+                st.session_state.completed_songs = updated
+
+
 # --- 1. LOGIN GATE ---
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -859,6 +917,13 @@ if st.session_state.authenticated:
         st.session_state.completed_songs = completed
         st.session_state.final_done = final_done
         st.session_state.final_score = final_score
+
+    # Flush any saves that failed during a previous API outage.
+    _flush_pending_saves(FINAL_TEST_KEY)
+
+    if st.session_state.get(_PENDING_SAVES_KEY):
+        n = len(st.session_state[_PENDING_SAVES_KEY])
+        st.info(f"⏳ {n} result(s) pending sync — will retry automatically on the next interaction.")
 
     completed_songs = st.session_state.completed_songs  # dict: song_key -> score (or None)
 
@@ -1246,7 +1311,6 @@ if st.session_state.authenticated:
                     score = round(float(final_score), 2)
 
                 if wrong_song:
-                    score = min(score, 35.0)
                     st.session_state[f"_last_wrong_{song_key}"] = True
                 else:
                     st.session_state.pop(f"_last_wrong_{song_key}", None)
@@ -1271,11 +1335,9 @@ if st.session_state.authenticated:
                 }
 
                 if wrong_song:
-                    st.error(
-                        f"**Wrong padyam detected** — this recording does not match "
-                        f"**{display_name}**. "
-                        f"Please sing the **selected** padyam's lyrics and tap "
-                        f"**Discard & record again**."
+                    st.warning(
+                        f"Our system flagged this as a possible padyam mismatch for "
+                        f"**{display_name}**. If you sang the correct padyam, your score still counts."
                     )
 
                 st.subheader("How you did")
@@ -1302,11 +1364,9 @@ if st.session_state.authenticated:
                 voice_sig = _voice_signature(mfcc_user)
 
             # --- GOOGLE SHEETS UPSERT LOGIC ---
-            qualified = (score >= 85 and not wrong_song)
+            qualified = score >= 85
 
-            if wrong_song:
-                pass  # error already shown above; score capped — cannot qualify
-            elif qualified:
+            if qualified:
                 st.balloons()
                 st.success(f"🎉 PASS! You qualified for {display_name} with {score}%!")
 
@@ -1346,8 +1406,20 @@ if st.session_state.authenticated:
                         st.info(f"Your previous score of {prev_score}% for {display_name} "
                                 f"is already on record — keeping the higher result.")
                 except Exception as e:
-                    st.warning("Your score counts, but we couldn't reach the leaderboard right now. "
-                               "(Check that the Google Sheet is shared with the service account email.)")
+                    _queue_save(
+                        user_id=user_id,
+                        reg_id=st.session_state.registration_id,
+                        song_key=song_key,
+                        score=score,
+                        voice_sig=voice_sig,
+                        is_final_test=is_final_test,
+                        display_name=display_name,
+                    )
+                    st.warning(
+                        f"Your score of **{score}%** is saved locally and will sync automatically "
+                        f"once the connection is restored. No need to re-record. "
+                        f"({type(e).__name__}: {e})"
+                    )
             else:
                 st.error(f"Score: {score}%. You need 85% to qualify for {display_name}. Try again!")
 
