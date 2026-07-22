@@ -594,9 +594,12 @@ def authenticate(username, password):
     is_admin) on success, else None."""
     target_name = _norm_name(username)
     target_pwd = _norm_pwd(password)
-    for norm_name, norm_pwd, canonical_name, pwd in _get_admin_roster():
-        if norm_name == target_name and norm_pwd == target_pwd:
-            return canonical_name, pwd, True
+    try:
+        for norm_name, norm_pwd, canonical_name, pwd in _get_admin_roster():
+            if norm_name == target_name and norm_pwd == target_pwd:
+                return canonical_name, pwd, True
+    except Exception:
+        pass  # admins tab unavailable; participant login unaffected
     for norm_name, norm_pwd, canonical_name, reg_id in _get_roster():
         if norm_name == target_name and norm_pwd == target_pwd:
             return canonical_name, reg_id, False
