@@ -13,6 +13,7 @@ import datetime
 import pandas as pd
 import time
 import uuid
+import gc
 
 import tune_core as tc
 
@@ -128,6 +129,25 @@ INACTIVITY_LOGOUT_SEC = tc.INACTIVITY_LOGOUT_SEC
 ACTIVE_SESSION_WINDOW_SEC = tc.ACTIVE_SESSION_WINDOW_SEC
 
 _active_sessions = {}  # session_id -> last_seen unix timestamp
+_last_gc_time = time.time()
+_GC_INTERVAL = 300  # run cleanup every 5 minutes of wall-clock time
+
+
+def _maybe_gc():
+    """Prune stale session entries and run a GC pass every _GC_INTERVAL seconds.
+    Called at the top of each script rerun so cleanup happens passively without
+    a background thread."""
+    global _last_gc_time
+    now = time.time()
+    if now - _last_gc_time < _GC_INTERVAL:
+        return
+    # Remove session entries that have been inactive for 2× the tracking window.
+    cutoff = now - ACTIVE_SESSION_WINDOW_SEC * 2
+    for sid in list(_active_sessions.keys()):
+        if _active_sessions[sid] < cutoff:
+            del _active_sessions[sid]
+    gc.collect()
+    _last_gc_time = now
 
 
 def _session_id():
@@ -816,6 +836,8 @@ def _flush_pending_saves(final_key):
                 st.session_state.completed_songs = updated
 
 
+_maybe_gc()
+
 # --- 1. LOGIN GATE ---
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -1364,6 +1386,9 @@ if st.session_state.authenticated:
 
                 # Rough timbre fingerprint of this recording (used only if they qualify)
                 voice_sig = _voice_signature(mfcc_user)
+
+            # Free the large audio arrays immediately; DTW matrices can be several MB.
+            gc.collect()
 
             # --- GOOGLE SHEETS UPSERT LOGIC ---
             qualified = score >= 85
